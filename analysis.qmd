@@ -1,0 +1,7127 @@
+---
+title: "Retinal Microvasculature, HIV, and Cardiovascular Risk: Analysis Code"
+format: 
+  html: 
+    embed-resources: true
+    page-layout: full
+    toc: true 
+    toc-depth: 2
+    theme: journal
+    fontsize: 1.1em
+    linestretch: 1.7
+editor: source 
+editor_options:
+  chunk_output_type: console
+execute:
+  echo: true
+  warning: false
+  error: false
+knitr:
+  opts_chunk:
+    decimal.mark: "."
+    digits: 3
+---
+
+## About this document
+
+Analysis code for my BSc Honours project in Bioinformatics and Computational
+Biology (Stellenbosch University, 2024). It examines retinal microvascular
+measures in relation to HIV, antiretroviral therapy (ART) and cardiovascular
+disease (CVD) risk factors in adults from the EndoAfrica study.
+
+**The data are not included.** They are confidential participant data,
+collected under ethics approval and managed by the EndoAfrica study team. To
+render this document you need two files in a `data/` folder:
+
+- `data/endoafrica_retinal_data.xlsx`: the study spreadsheet
+- `data/variable_names_edited.txt`: a tab-delimited mapping from raw to clean
+  column names. It is a hand-edited copy of `data/variable_names_raw.csv`
+  (which this document writes), with the `new` column filled in.
+
+Rendering also writes figure files (`.svg` and `.png`) to the project folder.
+The random forest and decision tree sections at the end are exploratory and
+were not part of the final report.
+
+## Overview
+
+Packages and the shared plot theme.
+
+::: panel-tabset
+
+### Packages
+
+```{r}
+#| label: packages
+library(broom)
+library(caret)
+library(circlize)
+library(cowplot)
+library(ComplexHeatmap)
+library(dplyr)
+library(DT)
+library(ggplot2)
+library(janitor)
+library(lubridate)
+library(PCAtools)
+library(purrr)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(stringi)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(kableExtra)
+
+# Also required, called with :: below: readr, readxl
+```
+
+### Plot theme and colours
+
+```{r}
+#| label: plot-theme
+color_map_list <- c(
+  "Female" = "#C52233",
+  "Male" = "#2A7221",
+  "No" = "#C52233",
+  "Yes" = "#2A7221",
+  "NA" = "#D0EAF3",
+  ">5 years ago" = "#B1D4E7",
+  ">15 years ago" = "#8FB0CE",
+  "2 - 5 years ago" = "#6B8CC9",
+  "In last year" = "#2F5ABF",
+  "2nd" = "#D0EAF3",
+  "1st" = "#2F5ABF",
+  "Unknown" = "#D0EAF3",
+  "1-5 years" = "#B1D4E7",
+  "< 12 months" = "#8FB0CE",
+  "6-15 years" = "#6B8CC9",
+  "Yes currently" = "#2F5ABF",
+  "In the past" = "#8FB0CE",
+  "Never smoked" = "#D0EAF3",
+  "Type II Diabetes (also known as Non-insulin Dependent Diabetes)" = "#D0EAF3",
+  "Don't know" = "#2F5ABF",
+  "Viral load > 1000" = "#2A7221",
+  "Viral load < 1000" = "#C52233",
+  "Less than a year" = "#D0EAF3",
+  "1-5 years" = "#8FB0CE",
+  "More than 5 years" = "#2F5ABF"
+)
+
+# Light theme: white background, black text and lines, light grey grid
+custom_theme <- theme_light() +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    axis.line = element_line(color = "black"),
+    legend.background = element_rect(fill = "white"),
+    legend.text = element_text(color = "black"),
+    legend.title = element_text(color = "black"),
+    plot.title = element_text(size = 14, face = "bold", color = "black"),
+    plot.subtitle = element_text(size = 12, color = "black"),
+    plot.caption = element_text(size = 10, color = "black"),
+    panel.grid.major = element_line(color = "#F0EDEE", size = 0.5),
+    panel.grid.minor = element_line(color = "#F0EDEE", size = 0.25),
+    strip.text = element_text(size = 12, color = "black"),
+    strip.background = element_rect(fill = "white")
+  )
+
+theme_set(custom_theme)
+```
+
+:::
+
+## Data preparation
+
+Reads the EndoAfrica spreadsheet, cleans variable names and types, and builds the grouping variables and variable lists used in later sections.
+
+::: panel-tabset
+
+### Load and clean the EndoAfrica data
+
+```{r}
+#| label: load-clean-data
+path_dta <- "data/endoafrica_retinal_data.xlsx"
+
+dta <- readxl::read_xlsx(path_dta)
+
+# The sheet repeats its header row partway down (cases and controls are
+# stacked), so drop that row and any rows without a study ID
+dta <- dta |>
+  filter(!str_detect(`Study ID`, "Study ID") &
+    !is.na(`Study ID`))
+
+# Clean variable names ----
+
+# Names were mapped by hand in Excel: the raw and cleaned names are written
+# out, and the hand-edited mapping is read back in
+dta_names_clean <- tibble(
+  orig = names(dta),
+  new = NA
+)
+
+tmp <- clean_names(dta)
+
+dta <- clean_names(dta)
+
+tmp <- names(dta)
+
+dta_names_clean$interim <- tmp
+
+readr::write_csv(dta_names_clean, "data/variable_names_raw.csv")
+
+# Hand-edited mapping of raw to clean names (not included in the repository)
+tmp <- read.delim("data/variable_names_edited.txt")
+
+# Where no new name was given, keep the janitor-cleaned name
+tmp <- tmp |>
+  mutate(new = if_else(is.na(new) | new == "", interim, new))
+
+names(dta) <- tmp$new
+
+# make NA true NA ----
+
+for (i in names(dta)) {
+  dta[[i]][is.na(dta[[i]])] <- NA
+}
+
+# remove new crve/crae/ratio
+dta <- dta |>
+  select(-c(new_crae, new_crve, new_crae_crve_ratio))
+
+# Interview dates: convert Excel serial numbers to date-times
+dta <- dta |>
+  mutate(interview_start_time = as.numeric(interview_start_time))
+
+dta <- dta |>
+  mutate(interview_start_time = as.POSIXct(
+    (interview_start_time - 25569) * 86400,
+    origin = "1970-01-01",
+    tz = "UTC"
+  ))
+
+# Group recruitment sites (used in the bimodal-distribution plots)
+dta <- dta |>
+  mutate(
+    site_group = case_when(
+      recruitment_site %in% c("Uitsig", "Elsies", "Adriaanse", "Ravensmead") ~
+        "Cape Town Clinics",
+      recruitment_site == "Worcester" ~ "Worcester",
+      recruitment_site %in% c("Fisantekraal", "Durbanville") ~
+        "Northern Cape Town"
+    )
+  )
+
+# Interview month and season
+dta <- dta |>
+  mutate(
+    interview_start_time = as.POSIXct(
+      interview_start_time,
+      origin = "1970-01-01",
+      tz = "UTC"
+    ),
+    month = month(interview_start_time),
+    season = case_when(
+      month %in% c(5, 6, 7, 8) ~ "Warm",
+      month %in% c(9, 10, 11, 12, 1, 2, 3, 4) ~ "Cold",
+      TRUE ~ "Unknown" # Just in case there's an error
+    )
+  )
+
+# create cvd risk factor category
+dta <- dta |>
+  rowwise() |>
+  mutate(cvd_risk_factor = if_else(
+    any(
+      c(hypertension, heart_disease, high_cholesterol, tb, diabetes) == "Yes"
+    ),
+    "Yes",
+    "No"
+  )) |>
+  ungroup()
+
+# category for smoker
+dta <- dta |>
+  mutate(smoker_new = case_when(
+    smoker %in% c("Never smoked") ~ "No",
+    smoker %in% c("Yes currently", "In the past") ~ "Yes",
+    TRUE ~ smoker
+  ))
+
+# Find numeric and categorical variables ----
+
+# which vars contain numbers?
+x <- map_dbl(dta, ~ sum(str_detect(.x, "[0-9]+"), na.rm = TRUE))
+
+# of those, which ones also contain letters?
+xx <- which(x != 0)
+xxx <- map_dbl(dta[, xx], ~ sum(str_detect(.x, "[a-zA-Z]"), na.rm = TRUE))
+
+# put together those with no numbers and those with letters and numbers
+cats <- c(names(x)[which(x == 0)], names(xxx)[which(xxx != 0)])
+
+map(dta[, cats], ~ unique(.x))
+
+# acr_ratio and ldl should be numeric
+cats <- cats[!cats %in% c("acr_ratio", "ldl")]
+
+map(dta[, cats], ~ summary(.x[!is.na(.x)]))
+
+# numeric
+
+# remove x1 column, irrelevant
+dta <- dta |>
+  select(-x1)
+
+nums <- names(dta)[which(!names(dta) %in% cats)]
+
+map(dta[, nums], ~ summary(as.numeric(.x[!is.na(.x)])))
+
+# tortuosity_index is not rounded: at one decimal every value becomes 0.9
+
+# Clean numeric variables ----
+
+# check for letters or symbols in vars
+x <- dta |>
+  select(all_of(nums)) |>
+  map_dbl(~ sum(str_detect(.x, "^[^0-9]+$"), na.rm = TRUE))
+
+x <- x[x != 0]
+
+dta |>
+  select(all_of(names(x))) |>
+  distinct() |>
+  print(n = Inf)
+
+# fix - make all numeric vars numeric
+
+dta <- dta |>
+  mutate(across(all_of(nums), ~ as.numeric(.x)))
+
+dta |>
+  select(all_of(nums)) |>
+  summary()
+
+# Implausible values: ART durations over 4000 weeks become NA, and heights
+# under 3 (recorded in metres) are converted to cm
+thresholds <- list(
+  art_duration_weeks = 4000,
+  height_threshold = 3
+)
+
+dta <- dta |>
+  mutate(
+    art_duration_weeks = if_else(
+      art_duration_weeks > thresholds$art_duration_weeks,
+      NA_real_,
+      art_duration_weeks
+    ),
+    height = if_else(height < thresholds$height_threshold, height * 100, height)
+  )
+
+# Print summary of numeric columns
+dta |>
+  select(where(is.numeric)) |>
+  summary()
+
+# Clean character variables ----
+
+dta |>
+  select(all_of(cats)) |>
+  map(~ unique(.x))
+
+# make all long answers shorter in family history
+columns_to_modify <- c(
+  "father_diabetes", "father_heart_disease", "father_high_cholesterol",
+  "father_hypertension", "father_stroke", "mother_diabetes",
+  "mother_heart_disease", "mother_high_cholesterol", "mother_hypertension",
+  "mother_stroke", "alcohol_frequency", "physically_active"
+)
+
+modifications <- list(
+  "Yes, but I don't know the age" = "Yes",
+  "Don't know" = "Unknown",
+  "Yes, over the age of 60" = "Yes",
+  "Yes, under the age of 60" = "Yes",
+  "Yes, but I don't know type" = "Yes",
+  "8 or more days a month" = "Yes",
+  "Less than 8 days a month" = "Yes",
+  "Daily" = "Yes"
+)
+
+for (pattern in names(modifications)) {
+  dta <- dta |>
+    mutate(
+      across(
+        all_of(columns_to_modify[which(columns_to_modify %in% colnames(dta))]),
+        ~ case_when(
+          . == pattern ~ modifications[[pattern]],
+          TRUE ~ .
+        )
+      )
+    )
+}
+
+# Check the recoded answers
+dta |>
+  select(all_of(cats)) |>
+  map(~ unique(.x))
+
+# Log10-transform skewed variables
+dta <- dta |>
+  mutate(
+    log_crp = log10(crp),
+    log_ggt = log10(ggt),
+    log_viral_load = log10(viral_load),
+    log_acr_ratio = log10(acr_ratio),
+    log_microalbuminuria = log10(microalbuminuria),
+    log_ten_year_cvd_risk = log10(ten_year_cvd_risk)
+  )
+
+dta <- dta |>
+  select(
+    everything(),
+    crp, log_crp,
+    ggt, log_ggt,
+    viral_load, log_viral_load,
+    acr_ratio, log_acr_ratio,
+    microalbuminuria, log_microalbuminuria,
+    ten_year_cvd_risk, log_ten_year_cvd_risk,
+  )
+
+nums <- names(dta)[which(!names(dta) %in% cats)]
+
+nums <- names(dta)[!names(dta) %in% c(cats, "interview_start_time")]
+
+# Grouping variables for age, ART duration, viral load and CD4 count ----
+
+dta <- dta |>
+  mutate(age_group = cut(age,
+    breaks = c(18, 29, 39, 49, 59, 69, 79),
+    labels = c("18-29", "30-39", "40-49", "50-59", "60-69", "70-79"),
+    right = TRUE
+  ))
+
+dta <- dta |>
+  mutate(art_duration_group = cut(art_duration_weeks,
+    breaks = c(0, 52, 260, 1000),
+    labels = c("Less than a year", "1-5 years", "More than 5 years"),
+    right = TRUE
+  ))
+
+dta <- dta |>
+  mutate(viral_load_group = cut(viral_load,
+    breaks = c(0, 1000, 1000000),
+    labels = c("Viral load < 1000", "Viral load > 1000"),
+    right = TRUE
+  ))
+
+dta <- dta |>
+  mutate(cd_count_clinic_group = cut(cd4_count_clinic,
+    breaks = c(0, 200, 500, 100000),
+    labels = c("0-199", "200-499", "500+"),
+    right = TRUE
+  ))
+
+dta <- dta |>
+  mutate(cd_count_clinic_group_2 = cut(cd4_count_clinic,
+    breaks = c(0, 500, 100000),
+    labels = c("0-499", "500+"),
+    right = TRUE
+  ))
+
+dta <- dta |>
+  mutate(cd4_count_endo_group = cut(endo_result,
+    breaks = c(0, 200, 500, 100000),
+    labels = c("0-199", "200-499", "500+"),
+    right = TRUE
+  ))
+
+dta <- dta |>
+  mutate(cd4_count_endo_group_2 = cut(endo_result,
+    breaks = c(0, 500, 100000),
+    labels = c("0-499", "500+"),
+    right = TRUE
+  ))
+
+# ART regimen names (free text) mapped to medication class
+medication_classes <- c(
+  "NA" = "HIV negative",
+  "Aluvia Lamivudine Tenofovir" = "FDC",
+  "Odimune" = "FDC",
+  "Aluvia Tenofovir Lamuvidine Lopinavir ritonavir ciproflatoca" = "FDC",
+  "Odimune 1 daily (EFV, 3tc and Tenofovir)" = "FDC",
+  "Trivenz (ENT200+TEN300+EFA600) One daily" = "FDC",
+  "Trivenz (efavirenz, 3tc and TDF)" = "FDC",
+  "Aspen Nevirapine and Adco Lamivudine" = "FDC",
+  "Trivenz( EFV, Tenofovir, 3TC)" = "FDC",
+  "Tribuss( EFV, 3TC and TDF )" = "FDC",
+  "Odimune( efavirenz, 3tc and tenofovir )" = "FDC",
+  "Tribuss (EMT 200 +TEN 300 +EFA 600)" = "FDC",
+  "Tribuss ( EMT 200 + Ten 300 + EFA 600 )" = "FDC",
+  "Tribuss(EMT 200,TEN 300, EFR600)" = "FDC",
+  "Tribuss ( ENT 200, TEN 300, EFA 600)" = "FDC",
+  "Aluvia 200/50mg; Lamivudine/Zidovudine 150/300" = "FDC",
+  "Tribuss (Tenofovir/Emtricitabine /EFAV)" = "FDC",
+  "Tribuss / Odiomune" = "FDC",
+  "Tribuss" = "FDC",
+  "Tenovir/Emitricitabine/Efavirenz" = "FDC",
+  "TDF,FTC,EFV" = "FDC",
+  "Odimune (Tenovir300/Emtrcitabine200/EFAV600" = "FDC",
+  "Atroiza" = "NNRTI",
+  "Lamivudine 300mg / Tenofovir 300mg / Nevirapine 200mg" = "FDC",
+  "Atenef" = "NNRTI",
+  "Odimune  ( EMT  200, TEN300, EFA600)" = "FDC",
+  "Tenovir300 / Emitricitabine200 / Efavirenz600" = "FDC",
+  "TDC" = "HIV negative",
+  "odimune" = "FDC",
+  "Odimune + Aluvia" = "FDC",
+  "TDF / 3TC/NVP" = "FDC",
+  "TDF/3TC/Aluvia" = "FDC",
+  "Tenofovir / EMT / EFAV" = "FDC",
+  "Tenofovir 300/ Emtricitabine 200/ EFAV 600" = "FDC",
+  "Lamzid/Aluvia" = "FDC",
+  "FDC" = "FDC",
+  "TDF/FTC/EFU" = "FDC",
+  "TDF/FTC/EFV" = "FDC",
+  "TDF/3TC/NVP" = "FDC",
+  "Odimune 1 at night" = "FDC",
+  "ABC/3TC/Efv" = "FDC",
+  "Lamid/Aluvia" = "FDC",
+  "FDC Lamid/Efv" = "FDC",
+  "Aluvia, Tenemine" = "FDC",
+  "TDF/FTC/EFV (Odimune)" = "FDC",
+  "TDF/FTC,NVP" = "FDC",
+  "Tenofovir 300mg/ Emtriatabine 200mg/ Efavirenz 600mg" = "FDC",
+  "FDC, Atroiza" = "FDC",
+  "TDF / FTC / EFV" = "FDC",
+  "FDC (TDF/FTC/EFv)" = "FDC",
+  "Aluvia, Lomzid, Lamivudine/zidovudine, lopinavir/ritonavir" = "FDC",
+  "TDF300mg/FTC200mg/EFV600mg" = "FDC",
+  "FDC (TDF / FTC) NVP" = "FDC",
+  "FDC (TDF / FTC / EFV)" = "FDC",
+  "TDF / 3TC and Aluvia" = "FDC",
+  "FDC (TDF FTC EFV)" = "FDC",
+  "FDC (TDF/FTC/EFV)" = "FDC",
+  "FDC (TDF/EMT/EFV)" = "FDC",
+  "FDC (Ten/EMT/Efv)" = "FDC",
+  "FDC (Tdf/ Emt/ Efv)" = "FDC",
+  "TDF (3TC/EFV/FTC)" = "FDC",
+  "TDF (FTC/EFV/TDF)" = "FDC",
+  "FDC/FTC/TDF aluvia" = "FDC",
+  "FDC (Ten/Emt/Efv)" = "FDC",
+  "FDC (TDF/TC/EFV)" = "FDC",
+  "TDF/FTC/Aluvia" = "FDC",
+  "FDC (TDF/TTC/EFV)" = "FDC",
+  "TDP/3TC/NVP" = "FDC",
+  "TDF/FTC/Efv" = "FDC",
+  "Lamzia and ALluvia" = "FDC",
+  "FDC (Tnf/Efv/Emt)" = "FDC",
+  "FDC (Tdf/Ftc/Efv)" = "FDC",
+  "FDC (Tnf/Efv/Emt" = "FDC",
+  "Fen/Emtr/Evf" = "FDC"
+)
+
+dta <- dta |>
+  mutate(
+    medication_class = case_when(
+      is.na(art_name) & hiv_pos == "No" ~ "HIV negative",
+      is.na(art_name) ~ NA_character_,
+      art_name %in% names(medication_classes) ~ medication_classes[art_name],
+      TRUE ~ "Unknown"
+    )
+  )
+
+new_vars <- c(
+  "medication_class", "art_duration_group", "age_group", "art_duration_group",
+  "hiv_duration", "cd_count_clinic_group_2", "cd_count_clinic_group",
+  "cd4_count_endo_group", "cd4_count_endo_group_2", "viral_load_group"
+)
+
+cats <- c(cats, new_vars)
+
+dta <- dta |>
+  mutate(art_duration_group_2 = cut(art_duration_weeks,
+    breaks = c(0, 260, 1000),
+    labels = c("0-5 years", "More than 5 years"),
+    right = TRUE
+  ))
+
+new_vars <- c("viral_load", "art_duration_weeks", "endo_result")
+
+nums <- c(nums, new_vars)
+
+dta <- dta |>
+  mutate(across(all_of(cats), as.character))
+
+dta <- dta |>
+  mutate(across(all_of(nums), as.numeric))
+```
+
+### Variable groups used in later sections
+
+```{r}
+#| label: variable-groups
+# Clinical and retinal variables combined
+all_var <- c(
+  "total_cholesterol", "hdl", "ldl", "triglycerides", "fasting_glucose",
+  "hba1c", "crp", "ggt", "haemoglobin", "creatinine", "mdrd_egfr",
+  "urine_creatinine", "acr_ratio", "microalbuminuria", "cd4_count_clinic",
+  "endo_result", "ckd_epi_egfr", "ten_year_cvd_risk", "vascular_age",
+  "diameter_baseline", "fmd_percentage", "average_carotid_imt", "age", "bmi",
+  "waist_hip_ratio", "mean_systolic_pressure", "mean_diastolic_pressure",
+  "mean_heart_rate", "crae", "crve", "crae_crve_ratio", "segment_tree_area",
+  "total_length_skeletonised_tree", "segmented_fractal_analysis",
+  "skeleton_fractal_analysis", "fourier_fractal_enhanced",
+  "lacunarity_segmented", "lacunarity_skeleton", "branch_points", "endpoints",
+  "average_arterial_tree_diameter", "retinal_area", "arterial_tree_segments",
+  "tortuosity_index", "branch_segment_tortuosity_average",
+  "branch_segment_tortuosity_skewness", "branch_segment_tortuosity_kurtosis",
+  "branch_segment_length_average", "branch_segment_length_skewness",
+  "branch_segment_length_kurtosis", "arteriole_branch_parent_width",
+  "arteriole_branch_smaller_branch", "arteriole_branch_larger_branch",
+  "arteriole_branch_angle", "arteriole_branch_optimality",
+  "arteriole_mean_branching_coefficient", "arteriole_mean_asymmetry_ratio",
+  "arteriole_mean_angular_asymmetry", "venule_branch_parent_width",
+  "venule_branch_smaller_branch", "venule_branch_larger_branch",
+  "venule_branch_angle", "venule_branch_optimality",
+  "venule_mean_branching_coefficient", "venule_mean_asymmetry_ratio",
+  "venule_mean_angular_asymmetry"
+)
+
+# Drop the retinal measures with bimodal distributions (see bimodal_var)
+x <- all_var
+
+xx <- which(x %in% c(
+  "fourier_fractal_enhanced", "branch_segment_length_kurtosis",
+  "segment_tree_area", "total_length_skeletonised_tree", "branch_points",
+  "endpoints", "fourier_fractal_analysis", "lacunarity_segmented",
+  "lacunarity_skeleton", "retinal_area", "branch_segment_length_skewness",
+  "branch_segment_tortuosity_average", "tortuosity_index",
+  "arteriole_mean_branching_coefficient"
+))
+
+all_var <- x[-xx]
+
+# Clinical variables
+clinical_var <- c(
+  "total_cholesterol", "hdl", "ldl", "triglycerides", "fasting_glucose",
+  "hba1c", "crp", "ggt", "haemoglobin", "cd4_count_clinic", "endo_result",
+  "viral_load", "creatinine", "mdrd_egfr", "urine_creatinine", "acr_ratio",
+  "microalbuminuria", "ckd_epi_egfr", "ten_year_cvd_risk", "vascular_age",
+  "diameter_baseline", "fmd_percentage", "average_carotid_imt", "age", "bmi",
+  "waist_hip_ratio", "mean_systolic_pressure", "mean_diastolic_pressure",
+  "mean_heart_rate", "log_crp", "log_ggt", "log_viral_load", "log_acr_ratio",
+  "log_microalbuminuria", "log_ten_year_cvd_risk"
+)
+
+clinical_var_pca <- c(
+  "total_cholesterol", "hdl", "ldl", "triglycerides", "fasting_glucose",
+  "hba1c", "crp", "ggt", "haemoglobin", "creatinine", "mdrd_egfr",
+  "urine_creatinine", "acr_ratio", "microalbuminuria", "ckd_epi_egfr",
+  "ten_year_cvd_risk", "vascular_age", "diameter_baseline", "fmd_percentage",
+  "average_carotid_imt", "age", "bmi", "waist_hip_ratio",
+  "mean_systolic_pressure", "mean_diastolic_pressure", "mean_heart_rate"
+)
+
+clinical_var_art <- c(
+  "total_cholesterol", "hdl", "ldl", "triglycerides", "fasting_glucose",
+  "hba1c", "crp", "ggt", "haemoglobin", "cd4_count_clinic", "endo_result",
+  "viral_load", "creatinine", "mdrd_egfr", "urine_creatinine", "acr_ratio",
+  "microalbuminuria", "ckd_epi_egfr", "ten_year_cvd_risk", "vascular_age",
+  "diameter_baseline", "fmd_percentage", "average_carotid_imt", "age", "bmi",
+  "waist_hip_ratio", "mean_systolic_pressure", "mean_diastolic_pressure",
+  "mean_heart_rate"
+)
+
+# Retinal measures
+retinal_var <- c(
+  "crae", "crve", "crae_crve_ratio", "segment_tree_area",
+  "total_length_skeletonised_tree", "segmented_fractal_analysis",
+  "skeleton_fractal_analysis", "fourier_fractal_enhanced",
+  "lacunarity_segmented", "lacunarity_skeleton", "branch_points", "endpoints",
+  "average_arterial_tree_diameter", "retinal_area", "arterial_tree_segments",
+  "tortuosity_index", "branch_segment_tortuosity_average",
+  "branch_segment_tortuosity_skewness", "branch_segment_tortuosity_kurtosis",
+  "branch_segment_length_average", "branch_segment_length_skewness",
+  "branch_segment_length_kurtosis", "arteriole_branch_parent_width",
+  "arteriole_branch_smaller_branch", "arteriole_branch_larger_branch",
+  "arteriole_branch_angle", "arteriole_branch_optimality",
+  "arteriole_mean_branching_coefficient", "arteriole_mean_asymmetry_ratio",
+  "arteriole_mean_angular_asymmetry", "venule_branch_parent_width",
+  "venule_branch_smaller_branch", "venule_branch_larger_branch",
+  "venule_branch_angle", "venule_branch_optimality",
+  "venule_mean_branching_coefficient", "venule_mean_asymmetry_ratio",
+  "venule_mean_angular_asymmetry"
+)
+
+# Drop the retinal measures with bimodal distributions (see bimodal_var)
+x <- retinal_var
+
+xx <- which(x %in% c(
+  "branch_segment_length_kurtosis", "segment_tree_area",
+  "total_length_skeletonised_tree", "branch_points", "endpoints",
+  "fourier_fractal_analysis", "lacunarity_segmented", "lacunarity_skeleton",
+  "retinal_area", "branch_segment_length_skewness",
+  "branch_segment_tortuosity_average", "tortuosity_index",
+  "arteriole_mean_branching_coefficient"
+))
+
+retinal_var <- x[-xx]
+
+# Retinal measures in small groups, for plotting
+retinal_var_1 <- c("crae", "crve", "crae_crve_ratio")
+
+retinal_var_2 <- c(
+  "segmented_fractal_analysis", "skeleton_fractal_analysis",
+  "average_arterial_tree_diameter"
+)
+
+retinal_var_3 <- c(
+  "arterial_tree_segments", "branch_segment_tortuosity_skewness",
+  "branch_segment_tortuosity_kurtosis"
+)
+
+retinal_var_4 <- c(
+  "branch_segment_length_average", "arteriole_branch_parent_width",
+  "arteriole_branch_smaller_branch"
+)
+
+retinal_var_5 <- c(
+  "arteriole_branch_larger_branch", "arteriole_branch_angle",
+  "arteriole_branch_optimality"
+)
+
+retinal_var_6 <- c(
+  "arteriole_mean_asymmetry_ratio", "arteriole_mean_angular_asymmetry",
+  "venule_branch_parent_width"
+)
+
+retinal_var_7 <- c(
+  "venule_branch_smaller_branch", "venule_branch_larger_branch",
+  "venule_branch_angle"
+)
+
+retinal_var_8 <- c(
+  "venule_branch_optimality", "venule_mean_branching_coefficient"
+)
+
+retinal_var_9 <- c(
+  "venule_mean_asymmetry_ratio", "venule_mean_angular_asymmetry"
+)
+
+# Retinal measures with bimodal distributions
+bimodal_var_1 <- c(
+  "fourier_fractal_enhanced", "branch_segment_length_kurtosis",
+  "segment_tree_area"
+)
+
+bimodal_var_2 <- c(
+  "total_length_skeletonised_tree", "branch_points", "endpoints"
+)
+
+bimodal_var_3 <- c(
+  "lacunarity_segmented", "lacunarity_skeleton", "retinal_area"
+)
+
+bimodal_var_4 <- c(
+  "branch_segment_length_skewness", "branch_segment_tortuosity_average"
+)
+
+bimodal_var_5 <- c("tortuosity_index", "arteriole_mean_branching_coefficient")
+
+bimodal_var <- c(
+  "fourier_fractal_enhanced", "branch_segment_length_kurtosis",
+  "segment_tree_area", "total_length_skeletonised_tree", "branch_points",
+  "endpoints", "lacunarity_segmented", "lacunarity_skeleton", "retinal_area",
+  "branch_segment_length_skewness", "branch_segment_tortuosity_average",
+  "tortuosity_index", "arteriole_mean_branching_coefficient"
+)
+
+# Variable groups for tables and plots
+character_values <- c(
+  "age_group", "cvd_risk_factor", "on_art", "smoker", "clarity",
+  "recruitment_site", "past_heart_attack", "past_cancer", "past_tb",
+  "past_stroke", "hypertension", "heart_disease", "high_cholesterol", "tb",
+  "diabetes", "diabetes_type", "diabetes_duration", "father_diabetes",
+  "father_heart_disease", "father_high_cholesterol", "father_stroke",
+  "father_hypertension", "mother_diabetes", "mother_heart_disease",
+  "mother_high_cholesterol", "mother_hypertension", "mother_stroke", "hiv_pos",
+  "gender", "hiv_related", "art_line", "medication_class", "art_duration_group",
+  "age_group", "art_duration_group", "hiv_duration", "cd_count_clinic_group_2",
+  "cd_count_clinic_group", "cd4_count_endo_group", "cd4_count_endo_group_2",
+  "viral_load_group"
+)
+
+log_values <- c(
+  "log_crp", "log_ggt", "log_acr_ratio", "log_microalbuminuria",
+  "log_ten_year_cvd_risk"
+)
+
+log_values_hiv <- c(
+  "log_crp", "log_ggt", "log_viral_load", "log_acr_ratio",
+  "log_microalbuminuria", "log_ten_year_cvd_risk"
+)
+
+past_medical_history <- c(
+  "past_heart_attack", "past_cancer", "past_tb", "past_stroke"
+)
+
+medical_condition <- c(
+  "hypertension", "heart_disease", "high_cholesterol", "tb"
+)
+
+diabetes_lev <- c("diabetes", "diabetes_type", "diabetes_duration")
+
+family_history_1 <- c(
+  "father_diabetes", "father_heart_disease", "father_high_cholesterol",
+  "father_stroke", "father_hypertension"
+)
+
+family_history_2 <- c(
+  "mother_diabetes", "mother_heart_disease", "mother_high_cholesterol",
+  "mother_hypertension", "mother_stroke"
+)
+
+clarity <- c("clarity")
+
+gender <- c("gender")
+
+hiv_pos <- c("hiv_pos")
+
+hiv_related <- c("hiv_duration", "on_art", "art_line")
+
+art_name <- c("art_name")
+
+art_duration <- ("art_duration_weeks")
+
+health_dta <- c("age", "bmi", "waist_hip_ratio")
+
+mean_heart_measurements <- c(
+  "mean_systolic_pressure", "mean_diastolic_pressure", "mean_heart_rate"
+)
+
+lifestyle_factors <- c("smoker", "alcohol_frequency", "physically_active")
+
+clinical_dta_1 <- c(
+  "total_cholesterol", "hdl", "ldl", "triglycerides", "fasting_glucose",
+  "hba1c", "crp", "ggt", "haemoglobin"
+)
+
+clinical_dta_2 <- c("cd4_count_clinic", "cd4_count_endo_africa ", "viral_load")
+
+clinical_dta_3 <- c(
+  "creatinine", "mdrd_egfr", "urine_creatinine", "acr_ratio",
+  "microalbuminuria", "ckd_epi_egfr"
+)
+
+clinical_dta_4 <- c(
+  "10_year_cvd_risk", "vascular_age", "diameter_baseline", "fmd_percentage",
+  "average_carotid_imt"
+)
+
+clinical_dta_10 <- c("total_cholesterol", "hdl", "ldl")
+
+clinical_dta_11 <- c("triglycerides", "fasting_glucose", "hba1c")
+
+clinical_dta_12 <- c("crp", "ggt", "haemoglobin")
+
+clinical_dta_13 <- c("creatinine", "mdrd_egfr", "urine_creatinine")
+
+clinical_dta_14 <- c("acr_ratio", "microalbuminuria", "ckd_epi_egfr")
+
+clinical_dta_15 <- c("10_year_cvd_risk", "vascular_age", "diameter_baseline")
+
+clinical_dta_16 <- c("fmd_percentage", "average_carotid_imt")
+
+clinical_dta_17 <- c("cd4_count_clinic", "cd4_count_endo_africa ", "viral_load")
+
+parameters_1 <- c(
+  "crae", "crve", "crae_crve_ratio", "new_crae", "new_crve",
+  "new_crae_crve_ratio", "segment_tree_area", "total_length_skeletonised_tree",
+  "segmented_fractal_analysis"
+)
+
+parameters_2 <- c(
+  "skeleton_fractal_analysis", "fourier_fractal_enhanced",
+  "lacunarity_segmented", "lacunarity_skeleton", "branch_points", "endpoints",
+  "average_arterial_tree_diameter", "retinal_area", "arterial_tree_segments"
+)
+
+parameters_3 <- c(
+  "tortuosity_index", "branch_segment_tortuosity_average",
+  "branch_segment_tortuosity_skewness", "branch_segment_tortuosity_kurtosis",
+  "branch_segment_length_average", "branch_segment_length_skewness",
+  "branch_segment_length_kurtosis", "arteriole_branch_parent_width",
+  "arteriole_branch_smaller_branch"
+)
+
+parameters_4 <- c(
+  "arteriole_branch_larger_branch", "arteriole_branch_angle",
+  "arteriole_branch_optimality", "arteriole_mean_branching_coefficient",
+  "arteriole_mean_asymmetry_ratio", "arteriole_mean_angular_asymmetry",
+  "venule_branch_parent_width", "venule_branch_smaller_branch",
+  "venule_branch_larger_branch"
+)
+
+parameters_5 <- c(
+  "venule_branch_larger_branch", "venule_branch_angle",
+  "venule_branch_optimality", "venule_mean_branching_coefficient",
+  "venule_mean_asymmetry_ratio", "venule_mean_angular_asymmetry"
+)
+
+cvd_risk_factor <- c("cvd_risk_factor")
+
+parameters_10 <- c("crae", "crve", "crae_crve_ratio")
+
+parameters_11 <- c(
+  "segment_tree_area", "total_length_skeletonised_tree",
+  "segmented_fractal_analysis"
+)
+
+parameters_12 <- c(
+  "skeleton_fractal_analysis", "fourier_fractal_enhanced",
+  "lacunarity_segmented"
+)
+
+parameters_13 <- c("lacunarity_skeleton", "branch_points", "endpoints")
+
+parameters_14 <- c(
+  "average_arterial_tree_diameter", "retinal_area", "arterial_tree_segments"
+)
+
+parameters_15 <- c(
+  "tortuosity_index", "branch_segment_tortuosity_average",
+  "branch_segment_tortuosity_skewness"
+)
+
+parameters_16 <- c(
+  "branch_segment_tortuosity_kurtosis", "branch_segment_length_average",
+  "branch_segment_length_skewness"
+)
+
+parameters_17 <- c(
+  "branch_segment_length_kurtosis", "arteriole_branch_parent_width",
+  "arteriole_branch_smaller_branch"
+)
+
+parameters_18 <- c(
+  "arteriole_branch_larger_branch", "arteriole_branch_angle",
+  "arteriole_branch_optimality"
+)
+
+parameters_19 <- c(
+  "arteriole_mean_branching_coefficient", "arteriole_mean_asymmetry_ratio",
+  "arteriole_mean_angular_asymmetry"
+)
+
+parameters_20 <- c(
+  "venule_branch_parent_width", "venule_branch_smaller_branch",
+  "venule_branch_larger_branch"
+)
+
+parameters_21 <- c(
+  "venule_branch_larger_branch", "venule_branch_angle",
+  "venule_branch_optimality"
+)
+
+parameters_22 <- c(
+  "venule_mean_branching_coefficient", "venule_mean_asymmetry_ratio",
+  "venule_mean_angular_asymmetry"
+)
+```
+
+:::
+
+## Summary statistics
+
+Descriptive statistics for the whole sample and by HIV and ART status.
+
+::: panel-tabset
+
+### Whole sample: numeric
+
+```{r}
+#| label: summary-all-numeric
+# Summary statistics for each clinical variable
+dta_nums <- dta |>
+  select(study_id, event, hiv_pos, all_of(nums))
+
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos),
+    names_to = "key",
+    values_to = "value"
+  )
+
+summary_stats_clinical <- list()
+
+for (var in clinical_var) {
+  summary_statistics <- dta_nums |>
+    filter(key == var) |>
+    summarise(
+      mean = mean(value, na.rm = TRUE),
+      std_dev = sd(value, na.rm = TRUE),
+      `1st_quartile` = quantile(value, 0.25, na.rm = TRUE),
+      median = median(value, na.rm = TRUE),
+      `3rd_quartile` = quantile(value, 0.75, na.rm = TRUE),
+      min = min(value, na.rm = TRUE),
+      max = max(value, na.rm = TRUE),
+      .groups = "drop"
+    )
+  summary_stats_clinical[[var]] <- summary_statistics
+}
+
+summary_stats_df_numeric <- bind_rows(summary_stats_clinical, .id = "variable")
+
+datatable(summary_stats_df_numeric) |>
+  formatStyle(
+    columns = c(
+      "mean", "variable", "std_dev", "1st_quartile", "median", "3rd_quartile",
+      "min", "max"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "white"
+  ) |>
+  formatRound(
+    columns = c(
+      "mean", "variable", "std_dev", "1st_quartile", "median", "3rd_quartile",
+      "min", "max"
+    ),
+    digits = 4
+  )
+```
+
+### Whole sample: categorical
+
+```{r}
+#| label: summary-all-categorical
+# Percentage of participants in each category
+dta_cats <- dta |>
+  select(study_id, event, all_of(cats)) |>
+  pivot_longer(
+    cols = -c(event, study_id),
+    names_to = "key",
+    values_to = "value"
+  )
+
+summary_stats_categorical <- list()
+
+for (var in character_values) {
+  summary_statistics <- dta_cats |>
+    filter(key == var) |>
+    group_by(key, value) |>
+    summarise(count = n(), .groups = "drop") |>
+    group_by(key) |>
+    mutate(percent = (count / sum(count)) * 100) |>
+    select(key, outcome = value, percent)
+
+  summary_stats_categorical[[var]] <- summary_statistics
+}
+
+summary_stats_df_categorical <- bind_rows(
+  summary_stats_categorical,
+  .id = "key"
+)
+
+datatable(summary_stats_df_categorical) |>
+  formatStyle(
+    columns = c("key", "outcome", "percent"),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "white"
+  )
+```
+
+### Whole sample: retinal
+
+```{r}
+#| label: summary-all-retinal
+# Summary statistics for each retinal measure
+dta_nums <- dta |>
+  select(study_id, event, hiv_pos, all_of(retinal_var))
+
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos),
+    names_to = "key",
+    values_to = "value"
+  )
+
+summary_stats_clinical <- list()
+
+for (var in retinal_var) {
+  summary_statistics <- dta_nums |>
+    filter(key == var) |>
+    summarise(
+      mean = mean(value, na.rm = TRUE),
+      std_dev = sd(value, na.rm = TRUE),
+      `1st_quartile` = quantile(value, 0.25, na.rm = TRUE),
+      median = median(value, na.rm = TRUE),
+      `3rd_quartile` = quantile(value, 0.75, na.rm = TRUE),
+      min = min(value, na.rm = TRUE),
+      max = max(value, na.rm = TRUE),
+      .groups = "drop"
+    )
+  summary_stats_clinical[[var]] <- summary_statistics
+}
+
+summary_stats_df_numeric <- bind_rows(summary_stats_clinical, .id = "variable")
+
+datatable(summary_stats_df_numeric) |>
+  formatStyle(
+    columns = c(
+      "mean", "variable", "std_dev", "1st_quartile", "median", "3rd_quartile",
+      "min", "max"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "white"
+  ) |>
+  formatRound(
+    columns = c(
+      "mean", "std_dev", "1st_quartile", "median", "3rd_quartile", "min", "max"
+    ),
+    digits = 2
+  )
+```
+
+### HIV-positive vs HIV-negative: numeric
+
+```{r}
+#| label: summary-hiv-numeric
+# Clinical variables by HIV status
+dta_nums <- dta |>
+  select(study_id, event, hiv_pos, all_of(nums))
+
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos),
+    names_to = "key",
+    values_to = "value"
+  )
+
+hiv_summary_stats_clinical <- list()
+
+for (var in clinical_var) {
+  hiv_summary_statistics <- dta_nums |>
+    filter(key == var) |>
+    group_by(hiv_pos) |>
+    summarise(
+      mean = mean(value, na.rm = TRUE),
+      std_dev = sd(value, na.rm = TRUE),
+      `1st_quartile` = quantile(value, 0.25, na.rm = TRUE),
+      median = median(value, na.rm = TRUE),
+      `3rd_quartile` = quantile(value, 0.75, na.rm = TRUE),
+      min = min(value, na.rm = TRUE),
+      max = max(value, na.rm = TRUE),
+      .groups = "drop"
+    )
+  hiv_summary_stats_clinical[[var]] <- hiv_summary_statistics
+}
+
+hiv_summary_stats_df_numeric <- bind_rows(
+  hiv_summary_stats_clinical,
+  .id = "variable"
+)
+
+datatable(hiv_summary_stats_df_numeric) |>
+  formatStyle(
+    columns = c(
+      "mean", "variable", "std_dev", "1st_quartile", "median", "3rd_quartile",
+      "min", "max"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "white"
+  ) |>
+  formatRound(
+    columns = c(
+      "mean", "std_dev", "1st_quartile", "median", "3rd_quartile", "min", "max"
+    ),
+    digits = 2
+  )
+```
+
+### HIV-positive vs HIV-negative: categorical
+
+```{r}
+#| label: summary-hiv-categorical
+# Categorical variables by HIV status
+dta_cats <- dta |>
+  select(study_id, event, hiv_pos, all_of(cats)) |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos),
+    names_to = "key",
+    values_to = "value"
+  )
+
+hiv_summary_stats_categorical <- list()
+
+for (var in character_values) {
+  hiv_summary_statistics <- dta_cats |>
+    filter(key == var) |>
+    group_by(hiv_pos, key, value) |>
+    summarise(count = n(), .groups = "drop") |>
+    group_by(hiv_pos) |>
+    mutate(percent = (count / sum(count)) * 100) |>
+    select(category = value, percent)
+
+  hiv_summary_stats_categorical[[var]] <- hiv_summary_statistics
+}
+
+hiv_summary_stats_df_categorical <- bind_rows(
+  hiv_summary_stats_categorical,
+  .id = "variable"
+)
+
+datatable(hiv_summary_stats_df_categorical) |>
+  formatStyle(
+    columns = c("variable", "hiv_pos", "category", "percent"),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "white"
+  ) |>
+  formatRound(
+    columns = c("percent"),
+    digits = 2
+  )
+```
+
+### HIV-positive vs HIV-negative: retinal
+
+```{r}
+#| label: summary-hiv-retinal
+# Retinal measures by HIV status
+dta_nums <- dta |>
+  select(study_id, event, hiv_pos, all_of(retinal_var))
+
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos),
+    names_to = "key",
+    values_to = "value"
+  )
+
+hiv_summary_stats_clinical <- list()
+
+for (var in retinal_var) {
+  hiv_summary_statistics <- dta_nums |>
+    filter(key == var) |>
+    group_by(hiv_pos) |>
+    summarise(
+      mean = mean(value, na.rm = TRUE),
+      std_dev = sd(value, na.rm = TRUE),
+      `1st_quartile` = quantile(value, 0.25, na.rm = TRUE),
+      median = median(value, na.rm = TRUE),
+      `3rd_quartile` = quantile(value, 0.75, na.rm = TRUE),
+      min = min(value, na.rm = TRUE),
+      max = max(value, na.rm = TRUE),
+      .groups = "drop"
+    )
+  hiv_summary_stats_clinical[[var]] <- hiv_summary_statistics
+}
+
+hiv_summary_stats_df_numeric <- bind_rows(
+  hiv_summary_stats_clinical,
+  .id = "variable"
+)
+
+datatable(hiv_summary_stats_df_numeric) |>
+  formatStyle(
+    columns = c(
+      "mean", "variable", "std_dev", "1st_quartile", "median", "3rd_quartile",
+      "min", "max"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "white"
+  ) |>
+  formatRound(
+    columns = c(
+      "mean", "std_dev", "1st_quartile", "median", "3rd_quartile", "min", "max"
+    ),
+    digits = 2
+  )
+```
+
+### ART-naive vs on ART: numeric
+
+```{r}
+#| label: summary-art-numeric
+# Clinical variables by ART status
+dta_nums <- dta |>
+  select(study_id, event, on_art, all_of(nums))
+
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, on_art),
+    names_to = "key",
+    values_to = "value"
+  )
+art_summary_stats_clinical <- list()
+
+for (var in clinical_var) {
+  art_summary_statistics <- dta_nums |>
+    filter(key == var) |>
+    group_by(on_art) |>
+    summarise(
+      mean = mean(value, na.rm = TRUE),
+      std_dev = sd(value, na.rm = TRUE),
+      `1st_quartile` = quantile(value, 0.25, na.rm = TRUE),
+      median = median(value, na.rm = TRUE),
+      `3rd_quartile` = quantile(value, 0.75, na.rm = TRUE),
+      min = min(value, na.rm = TRUE),
+      max = max(value, na.rm = TRUE),
+      .groups = "drop"
+    )
+  art_summary_stats_clinical[[var]] <- art_summary_statistics
+}
+
+art_summary_stats_df_numeric <- bind_rows(
+  art_summary_stats_clinical,
+  .id = "variable"
+)
+
+datatable(art_summary_stats_df_numeric) |>
+  formatStyle(
+    columns = c(
+      "mean", "variable", "std_dev", "1st_quartile", "median", "3rd_quartile",
+      "min", "max"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "white"
+  ) |>
+  formatRound(
+    columns = c(
+      "mean", "std_dev", "1st_quartile", "median", "3rd_quartile", "min", "max"
+    ),
+    digits = 2
+  )
+```
+
+### ART-naive vs on ART: categorical
+
+```{r}
+#| label: summary-art-categorical
+# Categorical variables by ART status
+dta_cats <- dta |>
+  select(study_id, event, on_art, all_of(cats)) |>
+  pivot_longer(
+    cols = -c(event, study_id, on_art),
+    names_to = "key",
+    values_to = "value"
+  )
+
+art_summary_stats_categorical <- list()
+
+for (var in character_values) {
+  art_summary_statistics <- dta_cats |>
+    filter(key == var) |>
+    group_by(on_art, key, value) |>
+    summarise(count = n(), .groups = "drop") |>
+    group_by(on_art) |>
+    mutate(percent = (count / sum(count)) * 100) |>
+    select(category = value, percent)
+
+  art_summary_stats_categorical[[var]] <- art_summary_statistics
+}
+
+art_summary_stats_df_categorical <- bind_rows(
+  art_summary_stats_categorical,
+  .id = "variable"
+)
+
+datatable(art_summary_stats_df_categorical) |>
+  formatStyle(
+    columns = c("variable", "on_art", "category", "percent"),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "white"
+  )
+```
+
+### ART-naive vs on ART: retinal
+
+```{r}
+#| label: summary-art-retinal
+# Retinal measures by ART status
+dta_nums <- dta |>
+  select(study_id, event, on_art, all_of(retinal_var))
+
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, on_art),
+    names_to = "key",
+    values_to = "value"
+  )
+
+hiv_summary_stats_clinical <- list()
+
+for (var in retinal_var) {
+  hiv_summary_statistics <- dta_nums |>
+    filter(key == var) |>
+    group_by(on_art) |>
+    summarise(
+      mean = mean(value, na.rm = TRUE),
+      std_dev = sd(value, na.rm = TRUE),
+      `1st_quartile` = quantile(value, 0.25, na.rm = TRUE),
+      median = median(value, na.rm = TRUE),
+      `3rd_quartile` = quantile(value, 0.75, na.rm = TRUE),
+      min = min(value, na.rm = TRUE),
+      max = max(value, na.rm = TRUE),
+      .groups = "drop"
+    )
+  hiv_summary_stats_clinical[[var]] <- hiv_summary_statistics
+}
+
+hiv_summary_stats_df_numeric <- bind_rows(
+  hiv_summary_stats_clinical,
+  .id = "variable"
+)
+
+datatable(hiv_summary_stats_df_numeric) |>
+  formatStyle(
+    columns = c(
+      "mean", "variable", "std_dev", "1st_quartile", "median", "3rd_quartile",
+      "min", "max"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "white"
+  ) |>
+  formatRound(
+    columns = c(
+      "mean", "std_dev", "1st_quartile", "median", "3rd_quartile", "min", "max"
+    ),
+    digits = 2
+  )
+```
+
+:::
+
+## Exploration: HIV-positive vs HIV-negative
+
+Bar graphs, box plots and density plots comparing HIV-positive and HIV-negative participants.
+
+::: panel-tabset
+
+### Bar graphs
+
+```{r}
+#| label: explore-hiv-bar
+# Bar graphs of categorical variables by HIV status
+
+# select character data
+dta_cats <- dta |>
+  select(study_id, event, hiv_pos, all_of(cats))
+
+# pivot character data
+dta_cats <- dta_cats |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_bar <- function(data, vars, var_fill, angl, ncols) {
+  tmp <- data |>
+    distinct(study_id, hiv_pos) |>
+    group_by(hiv_pos) |>
+    count(name = "total") |>
+    inner_join(data |>
+      group_by(hiv_pos, key, value) |>
+      count()) |>
+    mutate(perc = n / total * 100) |>
+    arrange(key)
+
+  unique_values <- unique(tmp$value)
+  color_map_filtered <- color_map_list[names(color_map_list) %in% unique_values]
+
+  p <- tmp |>
+    filter(key %in% vars) |>
+    ggplot(aes(x = hiv_pos, y = perc, fill = value)) +
+    geom_col(position = "dodge") +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    labs(y = "Percentage") +
+    scale_fill_manual(values = color_map_list) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  past_medical_history, medical_condition, family_history_1, family_history_2,
+  gender
+)) {
+  plot_bar(
+    data = dta_cats,
+    vars = group,
+    var_fill = "value",
+    angl = 45,
+    ncols = 2
+  ) |>
+    print()
+}
+
+for (group in list(diabetes_lev, lifestyle_factors)) {
+  plot_bar(
+    data = dta_cats,
+    vars = group,
+    var_fill = "value",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Box plots
+
+```{r}
+#| label: explore-hiv-box
+# Box plots of numeric variables by HIV status
+
+# select numeric data
+dta_nums <- dta |>
+  select(study_id, event, hiv_pos, all_of(nums))
+
+# pivot numeric data
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos),
+    names_to = "key",
+    values_to = "value"
+  )
+
+# make function
+plot_box <- function(data, vars, var_fill, angl, ncols) {
+  p <- data |>
+    filter(key %in% vars) |>
+    ggplot(aes(x = hiv_pos, y = value, color = hiv_pos)) +
+    geom_boxplot(fill = NA) +
+    scale_color_manual(values = var_fill) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+# for loop to make graphs
+for (group in list(
+  health_dta, mean_heart_measurements, clinical_dta_10, clinical_dta_11,
+  clinical_dta_12, clinical_dta_13, clinical_dta_14, clinical_dta_15,
+  clinical_dta_16, retinal_var_1, retinal_var_2, retinal_var_3, retinal_var_4,
+  retinal_var_5, retinal_var_6, retinal_var_7, retinal_var_8, retinal_var_9,
+  log_values
+)) {
+  plot_box(
+    data = dta_nums,
+    vars = group,
+    var_fill = color_map_list,
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Density plots
+
+```{r}
+#| label: explore-hiv-density
+# Density plots of numeric variables by HIV status
+
+# Select relevant columns from the original data
+dta_nums <- dta |>
+  select(study_id, event, hiv_pos, all_of(nums))
+
+# Pivot numeric data
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos),
+    names_to = "key",
+    values_to = "value"
+  )
+
+# Function to create density plots
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, color = .data[[var_fill]])) +
+    geom_density(fill = NA, linewidth = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    scale_color_manual(values = c("No" = "#C52233", "Yes" = "#2A7221")) +
+    theme(
+      axis.text.x = element_text(size = 18), # Increase x-axis number size
+      axis.title.x = element_text(size = 20), # Increase x-axis title size
+      axis.text.y = element_text(size = 16), # Adjust y-axis number size
+      axis.title.y = element_text(size = 20),
+      strip.text = element_text(size = 16),
+      legend.text = element_text(size = 16), # Size of legend text
+      legend.title = element_text(size = 20),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+combined_plot <- plot_density(
+  data = dta_nums,
+  vars = retinal_var_2,
+  var_fill = "hiv_pos",
+  angl = 45,
+  ncols = 3
+)
+print(combined_plot)
+ggsave(
+  "hiv_ret_var_combined.svg",
+  plot = combined_plot,
+  width = 12,
+  height = 10
+)
+
+for (group in list(
+  health_dta, mean_heart_measurements, clinical_dta_10, clinical_dta_11,
+  clinical_dta_12, clinical_dta_13, clinical_dta_14, clinical_dta_15,
+  clinical_dta_16, clinical_dta_17, retinal_var_1, retinal_var_2, retinal_var_3,
+  retinal_var_4, retinal_var_5, retinal_var_6, retinal_var_7, retinal_var_8,
+  retinal_var_9
+)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "hiv_pos",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+
+for (group in list(bimodal_var_1, bimodal_var_2, bimodal_var_3)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "hiv_pos",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+
+for (group in list(bimodal_var_4, bimodal_var_5)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "hiv_pos",
+    angl = 45,
+    ncols = 2
+  ) |>
+    print()
+}
+```
+
+:::
+
+## Exploration: on ART vs ART-naive
+
+The same plots for participants on ART and ART-naive participants, plus retinal measures by ART duration and viral load group.
+
+::: panel-tabset
+
+### Bar graphs
+
+```{r}
+#| label: explore-art-bar
+# Bar graphs of categorical variables by ART status
+
+# select character data
+dta_cats <- dta |>
+  select(study_id, event, hiv_pos, on_art, all_of(cats))
+
+# pivot character data
+dta_cats <- dta_cats |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos, on_art),
+    names_to = "key",
+    values_to = "value"
+  )
+
+# make function
+plot_bar <- function(data, vars, var_fill, angl, ncols) {
+  data <- data |>
+    filter(!is.na(on_art))
+
+  tmp <- data |>
+    distinct(study_id, on_art) |>
+    group_by(on_art) |>
+    count(name = "total") |>
+    inner_join(data |>
+      group_by(on_art, key, value) |> count()) |>
+    mutate(perc = n / total * 100) |>
+    arrange(key)
+
+  p <- tmp |>
+    filter(key %in% vars) |>
+    ggplot(aes(x = hiv_pos, y = perc, fill = value)) +
+    geom_col(position = "dodge") +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    labs(y = "Percentage") +
+    scale_fill_manual(values = color_map_list) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  gender, past_medical_history, medical_condition, family_history_1,
+  family_history_2, hiv_related
+)) {
+  plot_bar(
+    data = dta_cats,
+    vars = group,
+    var_fill = "value",
+    angl = 45,
+    ncols = 2
+  ) |>
+    print()
+}
+
+for (group in list(diabetes_lev, lifestyle_factors)) {
+  plot_bar(
+    data = dta_cats,
+    vars = group,
+    var_fill = "value",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Box plots
+
+```{r}
+#| label: explore-art-box
+# Box plots of numeric variables by ART status
+
+# select numeric data
+dta_nums <- dta |>
+  select(study_id, event, hiv_pos, on_art, all_of(nums))
+
+# pivot numeric data
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos, on_art),
+    names_to = "key",
+    values_to = "value"
+  )
+
+# make function
+plot_box <- function(data, vars, var_fill, angl, ncols) {
+  data <- data |>
+    filter(!is.na(on_art))
+
+  p <- data |>
+    filter(key %in% vars) |>
+    ggplot(aes(x = on_art, y = value, color = on_art)) +
+    geom_boxplot(fill = NA) +
+    scale_color_manual(values = var_fill) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  health_dta, mean_heart_measurements, clinical_dta_10, clinical_dta_11,
+  clinical_dta_12, clinical_dta_13, clinical_dta_14, clinical_dta_15,
+  clinical_dta_16, clinical_dta_17, retinal_var_1, retinal_var_2, retinal_var_3,
+  retinal_var_4, retinal_var_5, retinal_var_6, retinal_var_7, retinal_var_8,
+  retinal_var_9, log_values
+)) {
+  plot_box(
+    data = dta_nums,
+    vars = group,
+    var_fill = color_map_list,
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Box plots: ART duration
+
+```{r}
+#| label: explore-art-box-duration
+# Box plots of retinal measures by ART duration group
+dta_nums <- dta |>
+  select(study_id, on_art, art_duration_group, all_of(retinal_var))
+
+# pivot numeric data
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(study_id, on_art, art_duration_group),
+    names_to = "key",
+    values_to = "value"
+  )
+
+# make function
+plot_box <- function(data, vars, var_fill, angl, ncols) {
+  data <- data |>
+    filter(!is.na(on_art))
+
+  p <- data |>
+    filter(key %in% vars) |>
+    ggplot(aes(x = art_duration_group, y = value, color = art_duration_group)) +
+    geom_boxplot(fill = NA) +
+    scale_color_manual(values = var_fill) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  retinal_var_1, retinal_var_2, retinal_var_3, retinal_var_4, retinal_var_5,
+  retinal_var_6, retinal_var_7, retinal_var_8, retinal_var_9
+)) {
+  plot_box(
+    data = dta_nums,
+    vars = group,
+    var_fill = color_map_list,
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Box plots: viral load
+
+```{r}
+#| label: explore-art-box-viral-load
+# Box plots of retinal measures by viral load group
+dta_nums <- dta |>
+  select(study_id, on_art, viral_load_group, all_of(retinal_var))
+
+# pivot numeric data
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(study_id, on_art, viral_load_group),
+    names_to = "key",
+    values_to = "value"
+  )
+
+# make function
+plot_box <- function(data, vars, var_fill, angl, ncols) {
+  data <- data |>
+    filter(!is.na(on_art))
+
+  p <- data |>
+    filter(key %in% vars) |>
+    ggplot(aes(x = viral_load_group, y = value, color = viral_load_group)) +
+    geom_boxplot(fill = NA) +
+    scale_color_manual(values = var_fill) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  retinal_var_1, retinal_var_2, retinal_var_3, retinal_var_4, retinal_var_5,
+  retinal_var_6, retinal_var_7, retinal_var_8, retinal_var_9
+)) {
+  plot_box(
+    data = dta_nums,
+    vars = group,
+    var_fill = color_map_list,
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Density plots
+
+```{r}
+#| label: explore-art-density
+# Density plots of numeric variables by ART status
+
+# select numeric data
+dta_nums <- dta |>
+  select(study_id, event, on_art, all_of(nums))
+
+# pivot numeric data
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, on_art),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  data <- data |>
+    filter(!is.na(on_art))
+
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, color = .data[[var_fill]])) +
+    geom_density(fill = NA, linewidth = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    scale_color_manual(values = c("No" = "#C52233", "Yes" = "#2A7221")) +
+    theme(
+      axis.text.x = element_text(size = 18), # Increase x-axis number size
+      axis.title.x = element_text(size = 20), # Increase x-axis title size
+      axis.text.y = element_text(size = 16), # Adjust y-axis number size
+      axis.title.y = element_text(size = 20),
+      strip.text = element_text(size = 16),
+      legend.text = element_text(size = 16), # Size of legend text
+      legend.title = element_text(size = 20),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+combined_plot <- plot_density(
+  data = dta_nums,
+  vars = retinal_var_2,
+  var_fill = "on_art",
+  angl = 45,
+  ncols = 3
+)
+print(combined_plot)
+ggsave(
+  "art_ret_var_combined.svg",
+  plot = combined_plot,
+  width = 12,
+  height = 10
+)
+
+for (group in list(
+  health_dta, mean_heart_measurements, clinical_dta_10, clinical_dta_11,
+  clinical_dta_12, clinical_dta_13, clinical_dta_14, clinical_dta_15,
+  clinical_dta_16, clinical_dta_17, retinal_var_1, retinal_var_2, retinal_var_3,
+  retinal_var_4, retinal_var_5, retinal_var_6, retinal_var_7, retinal_var_8,
+  retinal_var_9
+)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "on_art",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+
+for (group in list(bimodal_var_1, bimodal_var_2, bimodal_var_3)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "on_art",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+
+for (group in list(bimodal_var_4, bimodal_var_5)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "on_art",
+    angl = 45,
+    ncols = 2
+  ) |>
+    print()
+}
+```
+
+:::
+
+## Exploration: reasons for bimodal distributions
+
+Density plots checking whether retinal measures with two peaks split by gender, diabetes, smoking, recruitment site, hypertension, high cholesterol, season or image quality.
+
+::: panel-tabset
+
+### Gender
+
+```{r}
+#| label: bimodal-gender
+# Density plots by gender
+
+# select numeric data
+dta_nums <- dta |>
+  select(study_id, event, gender, all_of(nums))
+
+# pivot numeric data
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, gender),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, fill = .data[[var_fill]])) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  parameters_1, parameters_2, parameters_3, parameters_4, parameters_5
+)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "gender",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Diabetes
+
+```{r}
+#| label: bimodal-diabetes
+# Density plots by diabetes
+
+# select numeric data
+dta_nums <- dta |>
+  select(study_id, event, diabetes, all_of(nums))
+
+# pivot numeric data
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, diabetes),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, fill = .data[[var_fill]])) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  parameters_1, parameters_2, parameters_3, parameters_4, parameters_5
+)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "diabetes",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Smoking
+
+```{r}
+#| label: bimodal-smoking
+# Density plots by smoking status
+
+# select numeric data
+dta_nums <- dta |>
+  select(study_id, event, smoker, all_of(nums))
+
+# pivot numeric data
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, smoker),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, fill = .data[[var_fill]])) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  parameters_1, parameters_2, parameters_3, parameters_4, parameters_5
+)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "smoker",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Recruitment site
+
+```{r}
+#| label: bimodal-site
+# Density plots by recruitment site
+
+# select numeric data
+dta_nums <- dta |>
+  select(study_id, event, recruitment_site, all_of(nums))
+
+# pivot numeric data
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, recruitment_site),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, fill = .data[[var_fill]])) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  parameters_1, parameters_2, parameters_3, parameters_4, parameters_5
+)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "recruitment_site",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Hypertension
+
+```{r}
+#| label: bimodal-hypertension
+# Density plots by hypertension
+
+# select numeric data
+dta_nums <- dta |>
+  select(study_id, event, hypertension, all_of(nums))
+
+# pivot numeric data
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, hypertension),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, fill = .data[[var_fill]])) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  parameters_1, parameters_2, parameters_3, parameters_4, parameters_5
+)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "hypertension",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### High cholesterol
+
+```{r}
+#| label: bimodal-cholesterol
+# Density plots by high cholesterol
+
+# select numeric data
+dta_nums <- dta |>
+  select(study_id, event, high_cholesterol, all_of(nums))
+
+# pivot numeric data
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, high_cholesterol),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, fill = .data[[var_fill]])) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  parameters_1, parameters_2, parameters_3, parameters_4, parameters_5
+)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "high_cholesterol",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Warm vs cold months
+
+```{r}
+#| label: bimodal-season
+# Density plots by season
+dta_nums <- dta |>
+  select(study_id, event, season, all_of(retinal_var))
+
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, season),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, fill = .data[[var_fill]])) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  parameters_1, parameters_2, parameters_3, parameters_4, parameters_5
+)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "season",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Image quality
+
+```{r}
+#| label: bimodal-image-quality
+# Density plots by image quality (clarity)
+dta_nums <- dta |>
+  select(study_id, event, clarity, all_of(retinal_var))
+
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, clarity),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, fill = .data[[var_fill]])) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  parameters_1, parameters_2, parameters_3, parameters_4, parameters_5
+)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "clarity",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Recruitment site groups
+
+```{r}
+#| label: bimodal-site-group
+# Density plots by recruitment site group
+dta_nums <- dta |>
+  select(study_id, event, site_group, all_of(retinal_var))
+
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, site_group),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, fill = .data[[var_fill]])) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(
+  parameters_1, parameters_2, parameters_3, parameters_4, parameters_5
+)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "site_group",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Bimodal retinal variables: HIV status
+
+```{r}
+#| label: bimodal-vars-hiv
+# Density plots of the bimodal retinal measures by HIV status
+dta_nums <- dta |>
+  select(study_id, event, hiv_pos, all_of(bimodal_var))
+
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, fill = .data[[var_fill]])) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(bimodal_var_1, bimodal_var_2)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "hiv_pos",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+```
+
+### Bimodal retinal variables: ART status
+
+```{r}
+#| label: bimodal-vars-art
+# Density plots of the bimodal retinal measures by ART status
+# Note: this overwrites bimodal_var for the rest of the document
+x <- bimodal_var
+
+xx <- which(x %in% c(
+  "fourier_fractal_enhanced", "arteriole_mean_branching_coefficient",
+  "branch_segment_length_skewness", "lacunarity_skeleton", "tortuosity_index"
+))
+
+bimodal_var <- x[-xx]
+
+dta_nums <- dta |>
+  select(study_id, event, on_art, all_of(bimodal_var))
+
+dta_nums <- dta_nums |>
+  pivot_longer(
+    cols = -c(event, study_id, on_art),
+    names_to = "key",
+    values_to = "value"
+  )
+
+plot_density <- function(data, vars, var_fill, angl, ncols) {
+  data <- data |>
+    filter(!is.na(on_art))
+
+  p <- data |>
+    filter(key %in% vars) |>
+    na.omit() |>
+    ggplot(aes(x = value, fill = .data[[var_fill]])) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~key, scales = "free", ncol = ncols) +
+    theme(
+      axis.text.x = element_text(angle = angl, hjust = 1),
+      legend.position = "bottom"
+    )
+
+  return(p)
+}
+
+for (group in list(bimodal_var)) {
+  plot_density(
+    data = dta_nums,
+    vars = group,
+    var_fill = "on_art",
+    angl = 45,
+    ncols = 3
+  ) |>
+    print()
+}
+
+# Note: this redefines nums for all later sections. It drops most bimodal
+# retinal measures plus the raw body measurements and the individual
+# blood pressure and heart rate readings.
+x <- nums
+xx <- which(x %in% c(
+  "segment_tree_area", "total_length_skeletonised_tree", "branch_points",
+  "endpoints", "fourier_fractal_analysis", "lacunarity_segmented",
+  "lacunarity_skeleton", "retinal_area", "branch_segment_length_skewness",
+  "branch_segment_tortuosity_average", "tortuosity_index",
+  "arteriole_mean_branching_coefficient", "height", "hip_circumference",
+  "waist_circumference", "total_body_mass", "diastolic_bp", "systolic_bp",
+  "heart_rate", "diastolic_bp_2", "diastolic_bp_3", "systolic_bp_2",
+  "systolic_bp_3", "heart_rate_2", "heart_rate_3"
+))
+nums <- x[-xx]
+```
+
+:::
+
+## Difference tests (t-tests)
+
+Welch two-sample t-tests of each numeric variable between two groups, sorted by p-value.
+
+::: panel-tabset
+
+### HIV status
+
+```{r}
+#| label: ttest-hiv
+# Welch t-tests of numeric variables by HIV status
+dta_nums <- dta |>
+  select(study_id, event, hiv_pos, all_of(nums)) |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos),
+    names_to = "key",
+    values_to = "value"
+  )
+
+x <- unique(dta_nums$key)
+xx <- which(x %in% c(
+  "last_menstrual_period_days", "aspirin_dosage", "consent_date",
+  "interview_start_time", "art_duration_weeks", "age_began_regular_drinking",
+  "red_wine_units", "white_wine_units", "cd4_count_clinic", "endo_result",
+  "viral_load", "log_crp", "log_ggt", "log_viral_load", "log_acr_ratio",
+  "log_microalbuminuria", "log_ten_year_cvd_risk"
+))
+x <- x[-xx] # drop variables not tested here
+
+t_test_results <- vector("list", length(x))
+
+for (i in 1:length(x)) {
+  tmp <- dta_nums |>
+    filter(key == x[i])
+  t_test <- t.test(value ~ hiv_pos, data = tmp)
+  results <- tidy(t_test)
+  results$variable <- x[i]
+  t_test_results[[i]] <- results
+}
+
+selected_columns <- c(
+  "variable", "estimate", "p.value", "conf.low", "conf.high"
+)
+
+t_results_df <- bind_rows(t_test_results) |>
+  select(all_of(selected_columns)) |>
+  arrange(p.value)
+
+datatable(t_results_df) |>
+  formatStyle(
+    columns = c("variable", "estimate", "p.value", "conf.low", "conf.high"),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "white"
+  ) |>
+  formatRound(
+    columns = c("estimate", "p.value", "conf.low", "conf.high"),
+    digits = 3
+  )
+```
+
+### ART status
+
+```{r}
+#| label: ttest-art
+# Welch t-tests of numeric variables by ART status
+dta_nums <- dta |>
+  select(study_id, event, on_art, all_of(nums)) |>
+  pivot_longer(
+    cols = -c(event, study_id, on_art),
+    names_to = "key",
+    values_to = "value"
+  )
+
+x <- unique(dta_nums$key)
+xx <- which(x %in% c(
+  "last_menstrual_period_days", "aspirin_dosage", "consent_date",
+  "interview_start_time", "art_duration_weeks", "age_began_regular_drinking",
+  "red_wine_units", "white_wine_units", "log_crp", "log_ggt", "log_viral_load",
+  "log_acr_ratio", "log_microalbuminuria", "log_ten_year_cvd_risk"
+))
+x <- x[-xx] # drop variables not tested here
+
+t_test_results <- vector("list", length(x))
+
+for (i in 1:length(x)) {
+  tmp <- dta_nums |>
+    filter(key == x[i])
+  t_test <- t.test(value ~ on_art, data = tmp)
+  results <- tidy(t_test)
+  results$variable <- x[i]
+  t_test_results[[i]] <- results
+}
+
+selected_columns <- c(
+  "variable", "estimate", "p.value", "conf.low", "conf.high"
+)
+
+t_results_df <- bind_rows(t_test_results) |>
+  select(all_of(selected_columns)) |>
+  arrange(p.value)
+
+datatable(t_results_df) |>
+  formatStyle(
+    columns = c("variable", "estimate", "p.value", "conf.low", "conf.high"),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "white"
+  ) |>
+  formatRound(
+    columns = c("estimate", "p.value", "conf.low", "conf.high"),
+    digits = 3
+  )
+```
+
+### ART duration
+
+```{r}
+#| label: ttest-art-duration
+# Welch t-tests of numeric variables by ART duration (0-5 vs >5 years)
+dta_nums <- dta |>
+  select(study_id, event, art_duration_group_2, all_of(nums)) |>
+  pivot_longer(
+    cols = -c(event, study_id, art_duration_group_2),
+    names_to = "key",
+    values_to = "value"
+  )
+
+dta_nums$art_duration_group_2 <- factor(dta_nums$art_duration_group_2)
+
+levels(dta_nums$art_duration_group_2)
+
+x <- unique(dta_nums$key)
+xx <- which(x %in% c(
+  "last_menstrual_period_days", "aspirin_dosage", "consent_date",
+  "interview_start_time", "art_duration_weeks", "age_began_regular_drinking",
+  "red_wine_units", "white_wine_units", "log_crp", "log_ggt", "log_viral_load",
+  "log_acr_ratio", "log_microalbuminuria", "log_ten_year_cvd_risk"
+))
+x <- x[-xx] # drop variables not tested here
+
+t_test_results <- vector("list", length(x))
+
+for (i in 1:length(x)) {
+  tmp <- dta_nums |>
+    filter(key == x[i])
+  t_test <- t.test(value ~ art_duration_group_2, data = tmp)
+  results <- tidy(t_test)
+  results$variable <- x[i]
+  t_test_results[[i]] <- results
+}
+
+selected_columns <- c(
+  "variable", "estimate", "p.value", "conf.low", "conf.high"
+)
+
+t_results_df <- bind_rows(t_test_results) |>
+  select(all_of(selected_columns)) |>
+  arrange(p.value)
+
+datatable(t_results_df) |>
+  formatStyle(
+    columns = c("variable", "estimate", "p.value", "conf.low", "conf.high"),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "white"
+  )
+
+# Significant variables from the table above, entered by hand
+sig_art_duration <- c(
+  "venule_mean_asymmetry_ratio", "arterial_tree_segments", "fmd_percentage",
+  "waist_hip_ratio", "branch_segment_tortuosity_kurtosis",
+  "venule_branch_angle", "venule_branch_smaller_branch"
+)
+
+sig_art_duration_ret <- c(
+  "venule_mean_asymmetry_ratio", "arterial_tree_segments",
+  "branch_segment_tortuosity_kurtosis", "venule_branch_angle",
+  "venule_branch_smaller_branch"
+)
+```
+
+### Viral load
+
+```{r}
+#| label: ttest-viral-load
+# Welch t-tests of numeric variables by viral load group
+dta_nums <- dta |>
+  select(study_id, event, viral_load_group, all_of(nums)) |>
+  pivot_longer(
+    cols = -c(event, study_id, viral_load_group),
+    names_to = "key",
+    values_to = "value"
+  )
+
+dta_nums$viral_load_group <- factor(dta_nums$viral_load_group)
+
+levels(dta_nums$viral_load_group)
+
+x <- unique(dta_nums$key)
+xx <- which(x %in% c(
+  "last_menstrual_period_days", "aspirin_dosage", "consent_date",
+  "interview_start_time", "art_duration_weeks", "age_began_regular_drinking",
+  "red_wine_units", "white_wine_units", "log_crp", "log_ggt", "log_viral_load",
+  "log_acr_ratio", "log_microalbuminuria", "log_ten_year_cvd_risk"
+))
+x <- x[-xx] # drop variables not tested here
+
+t_test_results <- vector("list", length(x))
+
+for (i in 1:length(x)) {
+  tmp <- dta_nums |>
+    filter(key == x[i])
+  t_test <- t.test(value ~ viral_load_group, data = tmp)
+  results <- tidy(t_test)
+  results$variable <- x[i]
+  t_test_results[[i]] <- results
+}
+
+selected_columns <- c(
+  "variable", "estimate", "p.value", "conf.low", "conf.high"
+)
+
+t_results_df <- bind_rows(t_test_results) |>
+  select(all_of(selected_columns)) |>
+  arrange(p.value)
+
+datatable(t_results_df) |>
+  formatStyle(
+    columns = c("variable", "estimate", "p.value", "conf.low", "conf.high"),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "white"
+  )
+
+# Significant variables from the table above, entered by hand
+sig_viral_load <- c(
+  "crve", "crae_crve_ratio", "average_arterial_tree_diameter",
+  "arteriole_branch_angle", "venule_mean_angular_asymmetry",
+  "skeleton_fractal_analysis", "haemoglobin", "bmi", "hdl", "crp",
+  "arteriole_branch_smaller_branch", "arteriole_branch_larger_branch",
+  "branch_segment_tortuosity_kurtosis", "venule_branch_smaller_branch"
+)
+
+sig_viral_load_ret <- c(
+  "crve", "crae_crve_ratio", "average_arterial_tree_diameter",
+  "arteriole_branch_angle", "venule_mean_angular_asymmetry",
+  "skeleton_fractal_analysis", "arteriole_branch_smaller_branch",
+  "arteriole_branch_larger_branch", "branch_segment_tortuosity_kurtosis",
+  "venule_branch_smaller_branch"
+)
+```
+
+### CD4 count (clinic)
+
+```{r}
+#| label: ttest-cd4-clinic
+# Welch t-tests of numeric variables by clinic CD4 count (<500 vs 500+)
+dta_nums <- dta |>
+  select(study_id, event, cd_count_clinic_group_2, all_of(nums)) |>
+  pivot_longer(
+    cols = -c(event, study_id, cd_count_clinic_group_2),
+    names_to = "key",
+    values_to = "value"
+  )
+
+dta_nums$cd_count_clinic_group_2 <- factor(dta_nums$cd_count_clinic_group_2)
+
+levels(dta_nums$cd_count_clinic_group_2)
+
+x <- unique(dta_nums$key)
+xx <- which(x %in% c(
+  "last_menstrual_period_days", "aspirin_dosage", "consent_date",
+  "interview_start_time", "art_duration_weeks", "cd4_count_clinic",
+  "endo_result", "age_began_regular_drinking", "red_wine_units",
+  "white_wine_units", "viral_load", "log_crp", "log_ggt", "log_viral_load",
+  "log_acr_ratio", "log_microalbuminuria", "log_ten_year_cvd_risk"
+))
+x <- x[-xx] # drop variables not tested here
+
+t_test_results <- vector("list", length(x))
+
+for (i in 1:length(x)) {
+  tmp <- dta_nums |>
+    filter(key == x[i])
+  t_test <- t.test(value ~ cd_count_clinic_group_2, data = tmp)
+  results <- tidy(t_test)
+  results$variable <- x[i]
+  t_test_results[[i]] <- results
+}
+
+selected_columns <- c(
+  "variable", "estimate", "p.value", "conf.low", "conf.high"
+)
+
+t_results_df <- bind_rows(t_test_results) |>
+  select(all_of(selected_columns)) |>
+  arrange(p.value)
+
+datatable(t_results_df) |>
+  formatStyle(
+    columns = c("variable", "estimate", "p.value", "conf.low", "conf.high"),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "white"
+  )
+
+# Significant variables from the table above, entered by hand
+sig_clinic_cd_count <- c(
+  "crve", "branch_segment_length_kurtosis", "arteriole_branch_larger_branch",
+  "arteriole_branch_optimality", "skeleton_fractal_analysis",
+  "arteriole_branch_smaller_branch", "branch_segment_length_average", "ldl",
+  "crp"
+)
+
+sig_clinic_cd_count_ret <- c(
+  "crve", "branch_segment_length_kurtosis", "arteriole_branch_larger_branch",
+  "arteriole_branch_optimality", "skeleton_fractal_analysis",
+  "arteriole_branch_smaller_branch", "branch_segment_length_average"
+)
+```
+
+### CD4 count (EndoAfrica)
+
+```{r}
+#| label: ttest-cd4-endo
+# Welch t-tests of numeric variables by EndoAfrica CD4 count (<500 vs 500+)
+dta_nums <- dta |>
+  select(study_id, event, cd4_count_endo_group_2, all_of(nums)) |>
+  pivot_longer(
+    cols = -c(event, study_id, cd4_count_endo_group_2),
+    names_to = "key",
+    values_to = "value"
+  )
+
+dta_nums$cd4_count_endo_group_2 <- factor(dta_nums$cd4_count_endo_group_2)
+
+levels(dta_nums$cd4_count_endo_group_2)
+
+x <- unique(dta_nums$key)
+xx <- which(x %in% c(
+  "last_menstrual_period_days", "aspirin_dosage", "consent_date",
+  "interview_start_time", "art_duration_weeks", "cd4_count_clinic",
+  "endo_result", "age_began_regular_drinking", "red_wine_units",
+  "white_wine_units", "viral_load", "log_crp", "log_ggt", "log_viral_load",
+  "log_acr_ratio", "log_microalbuminuria", "log_ten_year_cvd_risk"
+))
+x <- x[-xx] # drop variables not tested here
+
+t_test_results <- vector("list", length(x))
+
+for (i in 1:length(x)) {
+  tmp <- dta_nums |>
+    filter(key == x[i])
+  t_test <- t.test(value ~ cd4_count_endo_group_2, data = tmp)
+  results <- tidy(t_test)
+  results$variable <- x[i]
+  t_test_results[[i]] <- results
+}
+
+selected_columns <- c(
+  "variable", "estimate", "p.value", "conf.low", "conf.high"
+)
+
+t_results_df <- bind_rows(t_test_results) |>
+  select(all_of(selected_columns)) |>
+  arrange(p.value)
+
+datatable(t_results_df) |>
+  formatStyle(
+    columns = c("variable", "estimate", "p.value", "conf.low", "conf.high"),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "white"
+  )
+
+# Significant variables from the table above, entered by hand
+sig_endo_result <- c(
+  "arteriole_branch_larger_branch", "arteriole_branch_optimality",
+  "arteriole_branch_smaller_branch", "ggt", "triglycerides", "crve", "bmi",
+  "crp", "average_arterial_tree_diameter"
+)
+
+sig_endo_result_ret <- c(
+  "arteriole_branch_larger_branch", "arteriole_branch_optimality",
+  "arteriole_branch_smaller_branch", "crve", "average_arterial_tree_diameter"
+)
+```
+
+### Alcohol in the last 12 months
+
+```{r}
+#| label: ttest-alcohol
+# Welch t-tests of numeric variables by alcohol use in the last 12 months
+dta_nums <- dta |>
+  select(study_id, event, alcohol_last_12_months, all_of(nums)) |>
+  pivot_longer(
+    cols = -c(event, study_id, alcohol_last_12_months),
+    names_to = "key",
+    values_to = "value"
+  )
+
+dta_nums$alcohol_last_12_months <- factor(dta_nums$alcohol_last_12_months)
+
+levels(dta_nums$alcohol_last_12_months)
+
+x <- unique(dta_nums$key)
+xx <- which(x %in% c(
+  "last_menstrual_period_days", "aspirin_dosage", "consent_date",
+  "interview_start_time", "art_duration_weeks", "age_began_regular_drinking",
+  "red_wine_units", "white_wine_units", "cd4_count_clinic",
+  "cd4_count_endo_africa ", "viral_load", "log_crp", "log_ggt",
+  "log_viral_load", "log_acr_ratio", "log_microalbuminuria",
+  "log_ten_year_cvd_risk"
+))
+x <- x[-xx] # drop variables not tested here
+
+t_test_results <- vector("list", length(x))
+
+for (i in 1:length(x)) {
+  tmp <- dta_nums |>
+    filter(key == x[i])
+  t_test <- t.test(value ~ alcohol_last_12_months, data = tmp)
+  results <- tidy(t_test)
+  results$variable <- x[i]
+  t_test_results[[i]] <- results
+}
+
+selected_columns <- c(
+  "variable", "estimate", "p.value", "conf.low", "conf.high"
+)
+
+t_results_df <- bind_rows(t_test_results) |>
+  select(all_of(selected_columns)) |>
+  arrange(p.value)
+
+datatable(t_results_df) |>
+  formatStyle(
+    columns = c("variable", "estimate", "p.value", "conf.low", "conf.high"),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "white"
+  )
+
+sig_alcohol <- c("crae_crve_ratio", "arteriole_branch_angle", "ggt")
+sig_alcohol_ret <- c("crae_crve_ratio", "arteriole_branch_angle")
+```
+
+### Hypertension
+
+```{r}
+#| label: ttest-hypertension
+# Welch t-tests of numeric variables by hypertension
+dta_nums <- dta |>
+  select(study_id, event, hypertension, all_of(nums)) |>
+  filter(hypertension != "Unknown") |>
+  pivot_longer(
+    cols = -c(event, study_id, hypertension),
+    names_to = "key",
+    values_to = "value"
+  )
+
+dta_nums$hypertension <- factor(dta_nums$hypertension)
+
+levels(dta_nums$hypertension)
+
+x <- unique(dta_nums$key)
+xx <- which(x %in% c(
+  "last_menstrual_period_days", "aspirin_dosage", "consent_date",
+  "interview_start_time", "art_duration_weeks", "age_began_regular_drinking",
+  "red_wine_units", "white_wine_units", "cd4_count_clinic",
+  "cd4_count_endo_africa ", "viral_load", "log_crp", "log_ggt",
+  "log_viral_load", "log_acr_ratio", "log_microalbuminuria",
+  "log_ten_year_cvd_risk"
+))
+x <- x[-xx] # drop variables not tested here
+
+t_test_results <- vector("list", length(x))
+
+for (i in 1:length(x)) {
+  tmp <- dta_nums |>
+    filter(key == x[i])
+  t_test <- t.test(value ~ hypertension, data = tmp)
+  results <- tidy(t_test)
+  results$variable <- x[i]
+  t_test_results[[i]] <- results
+}
+
+selected_columns <- c(
+  "variable", "estimate", "p.value", "conf.low", "conf.high"
+)
+
+t_results_df <- bind_rows(t_test_results) |>
+  select(all_of(selected_columns)) |>
+  arrange(p.value)
+
+datatable(t_results_df) |>
+  formatStyle(
+    columns = c("variable", "estimate", "p.value", "conf.low", "conf.high"),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "white"
+  )
+
+# Significant variables from the table above, entered by hand
+sig_hypertension <- c(
+  "vascular_age", "age", "mean_systolic_pressure", "ten_year_cvd_risk",
+  "mean_diastolic_pressure", "ckd_epi_egfr", "bmi", "crae_crve_ratio", "crae",
+  "mdrd_egfr", "waist_hip_ratio", "fourier_fractal_enhanced",
+  "total_cholesterol", "average_carotid_imt", "hba1c", "fasting_glucose", "ldl",
+  "urine_creatinine", "triglycerides"
+)
+
+sig_hypertension_ret <- c("crae_crve_ratio", "crae", "fourier_fractal_enhanced")
+```
+
+### Smoking
+
+```{r}
+#| label: ttest-smoking
+# Welch t-tests of numeric variables by smoking status (yes/no)
+dta_nums <- dta |>
+  select(study_id, event, smoker_new, all_of(nums)) |>
+  pivot_longer(
+    cols = -c(event, study_id, smoker_new),
+    names_to = "key",
+    values_to = "value"
+  )
+dta_nums$smoker_new <- factor(dta_nums$smoker_new)
+
+levels(dta_nums$smoker_new)
+
+x <- unique(dta_nums$key)
+xx <- which(x %in% c(
+  "last_menstrual_period_days", "aspirin_dosage", "consent_date",
+  "interview_start_time", "art_duration_weeks", "age_began_regular_drinking",
+  "red_wine_units", "white_wine_units", "cd4_count_clinic",
+  "cd4_count_endo_africa ", "viral_load", "log_crp", "log_ggt",
+  "log_viral_load", "log_acr_ratio", "log_microalbuminuria",
+  "log_ten_year_cvd_risk"
+))
+x <- x[-xx] # drop variables not tested here
+
+t_test_results <- vector("list", length(x))
+
+for (i in 1:length(x)) {
+  tmp <- dta_nums |>
+    filter(key == x[i])
+  t_test <- t.test(value ~ smoker_new, data = tmp)
+  results <- tidy(t_test)
+  results$variable <- x[i]
+  t_test_results[[i]] <- results
+}
+
+selected_columns <- c(
+  "variable", "estimate", "p.value", "conf.low", "conf.high"
+)
+
+t_results_df <- bind_rows(t_test_results) |>
+  select(all_of(selected_columns)) |>
+  arrange(p.value)
+
+datatable(t_results_df) |>
+  formatStyle(
+    columns = c("variable", "estimate", "p.value", "conf.low", "conf.high"),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "white"
+  )
+
+# Significant variables from the table above, entered by hand
+sig_smoker <- c(
+  "bmi", "ten_year_cvd_risk", "crve", "crae", "vascular_age",
+  "skeleton_fractal_analysis", "mean_diastolic_pressure",
+  "segmented_fractal_analysis"
+)
+
+sig_smoker_ret <- c(
+  "crve", "crae", "skeleton_fractal_analysis", "segmented_fractal_analysis"
+)
+```
+
+:::
+
+## Pearson correlations
+
+Pearson correlations between clinical and retinal variables, and among the retinal measures.
+
+::: panel-tabset
+
+### Clinical vs retinal
+
+```{r}
+#| label: pearson-clinical-retinal
+# Pearson correlation for every clinical-retinal pair
+# Note: this redefines clinical_var for the rest of the document
+clinical_var <- c(
+  "total_cholesterol", "hdl", "ldl", "triglycerides", "fasting_glucose",
+  "hba1c", "crp", "ggt", "haemoglobin", "cd4_count_clinic", "viral_load",
+  "creatinine", "mdrd_egfr", "urine_creatinine", "acr_ratio",
+  "microalbuminuria", "ckd_epi_egfr", "diameter_baseline", "fmd_percentage",
+  "average_carotid_imt", "age", "bmi", "waist_hip_ratio",
+  "mean_systolic_pressure", "mean_diastolic_pressure", "mean_heart_rate"
+)
+
+combined_df <- expand.grid(x = clinical_var, y = retinal_var)
+
+results_list <- vector("list", nrow(combined_df))
+
+dta_nums <- dta |>
+  select(study_id, event, hiv_pos, all_of(nums)) |>
+  pivot_longer(
+    cols = -c(event, study_id, hiv_pos),
+    names_to = "key",
+    values_to = "value"
+  )
+
+for (i in 1:nrow(combined_df)) {
+  tmp_x <- dta_nums |>
+    filter(key == combined_df$x[i]) |>
+    select(study_id, x = value)
+  tmp_y <- dta_nums |>
+    filter(key == combined_df$y[i]) |>
+    select(study_id, y = value)
+  tmp <- tmp_x |>
+    inner_join(tmp_y, by = "study_id")
+  pearson_test <- suppressWarnings(cor.test(
+    x = tmp$x,
+    y = tmp$y,
+    method = "pearson"
+  ))
+  results_list[[i]] <- tidy(pearson_test) |>
+    mutate(x = combined_df$x[i], y = combined_df$y[i])
+}
+
+selected_columns <- c("x", "y", "p.value", "estimate", "statistic")
+
+combined_corr_results_pearson <- bind_rows(results_list) |>
+  select(all_of(selected_columns)) |>
+  arrange(p.value, estimate)
+
+datatable(combined_corr_results_pearson) |>
+  formatStyle(
+    columns = c("x", "y", "p.value", "estimate", "statistic"),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "white"
+  )
+```
+
+### Retinal vs retinal
+
+```{r}
+#| label: pearson-retinal-retinal
+# Pearson correlation for every pair of retinal measures
+retinal_df <- expand.grid(x = retinal_var, y = retinal_var)
+
+retinal_results_list <- vector("list", nrow(retinal_df))
+
+for (i in 1:nrow(retinal_df)) {
+  tmp_x <- dta_nums |>
+    filter(key == retinal_df$x[i]) |>
+    select(study_id, x = value)
+  tmp_y <- dta_nums |>
+    filter(key == retinal_df$y[i]) |>
+    select(study_id, y = value)
+  tmp <- tmp_x |>
+    inner_join(tmp_y, by = "study_id")
+  pearson_test <- suppressWarnings(cor.test(
+    x = tmp$x,
+    y = tmp$y,
+    method = "pearson"
+  ))
+  retinal_results_list[[i]] <- tidy(pearson_test) |>
+    mutate(x = retinal_df$x[i], y = retinal_df$y[i])
+}
+
+selected_columns <- c("x", "y", "p.value", "estimate", "statistic")
+
+retinal_corr_results_pearson <- bind_rows(retinal_results_list) |>
+  select(all_of(selected_columns)) |>
+  arrange(x, estimate)
+
+datatable(retinal_corr_results_pearson) |>
+  formatStyle(
+    columns = c("x", "y", "p.value", "estimate", "statistic"),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "white"
+  )
+```
+
+:::
+
+## Correlation heatmaps
+
+Heatmaps of the Pearson correlation coefficients from the previous section.
+
+::: panel-tabset
+
+### Clinical vs retinal
+
+```{r}
+#| label: corr-heatmap-clinical-retinal
+# Heatmap of the correlation coefficients
+clinical_plot <- ggplot(
+  combined_corr_results_pearson,
+  aes(x = reorder(x, estimate), y = reorder(y, estimate), fill = estimate)
+) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red", midpoint = 0,
+    name = "Pearson's Correlation"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Pearson's Correlation Heatmap",
+    x = "Clinical Variables",
+    y = "Retinal Variables"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 12),
+    axis.text.y = element_text(vjust = 1, size = 12),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14)
+  ) +
+  coord_fixed(ratio = 1)
+
+clinical_plot
+ggsave("correlation_heatmap_1.svg", plot = clinical_plot)
+```
+
+### Retinal vs retinal
+
+```{r}
+#| label: corr-heatmap-retinal-retinal
+# Heatmap of the correlation coefficients
+correlation_plot <- ggplot(
+  retinal_corr_results_pearson,
+  aes(x = reorder(x, estimate), y = reorder(y, estimate), fill = estimate)
+) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red", midpoint = 0,
+    name = "Pearson's Correlation"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Pearson's Correlation Heatmap",
+    x = "Clinical Variables",
+    y = "Retinal Variables"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+    axis.text.y = element_text(vjust = 1, size = 12),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14)
+  )
+
+ggsave(
+  "correlation_heatmap_2.svg",
+  plot = correlation_plot,
+  width = 10,
+  height = 8
+)
+```
+
+:::
+
+## Standardised heatmaps
+
+Retinal measures converted to z-scores and plotted per participant.
+
+::: panel-tabset
+
+### Whole sample
+
+```{r}
+#| label: zscore-heatmap-all
+# Z-scores of each retinal measure, one row per participant
+dta_standard <- dta |>
+  select(study_id, all_of(retinal_var)) |>
+  mutate(across(all_of(retinal_var), scale)) |>
+  pivot_longer(
+    cols = -study_id,
+    names_to = "retinal",
+    values_to = "value"
+  )
+
+ggplot(dta_standard, aes(x = retinal, y = study_id, fill = value[, ])) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "blue",
+    midpoint = 0,
+    limits = c(-3, 3)
+  ) +
+  labs(
+    title = "standardised retinal parameters",
+    x = "retinal parameters",
+    y = "study_id",
+    fill = "value"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### HIV status
+
+```{r}
+#| label: zscore-heatmap-hiv
+# Z-scores of each retinal measure, one row per participant
+dta_standard <- dta |>
+  select(study_id, hiv_pos, all_of(retinal_var)) |>
+  mutate(across(all_of(retinal_var), scale)) |>
+  pivot_longer(
+    cols = all_of(retinal_var),
+    names_to = "retinal",
+    values_to = "value"
+  )
+
+ggplot(
+  dta_standard,
+  aes(x = retinal, y = reorder(study_id, hiv_pos), fill = value[, ])
+) +
+  geom_tile() +
+  scale_fill_viridis_c(limit = c(-3, 3)) +
+  labs(
+    title = "Standardized Retinal Parameters",
+    x = "Retinal Parameters",
+    y = "Study ID",
+    fill = "Standardized Value"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+:::
+
+## Clustered heatmaps
+
+Z-scored retinal measures with hierarchical clustering (Euclidean distance, complete linkage) and group annotations, drawn with ComplexHeatmap.
+
+::: panel-tabset
+
+### HIV status
+
+```{r}
+#| label: cluster-hiv
+# Z-scored retinal measures with hierarchical clustering
+dta_clean <- dta |>
+  select(study_id, hiv_pos, all_of(retinal_var)) |>
+  mutate(across(all_of(retinal_var), scale))
+
+# Study IDs become row names; hiv_pos is kept out of the matrix and used
+# for the row annotation instead
+retinal_matrix <- dta_clean |>
+  column_to_rownames(var = "study_id") |>
+  select(-hiv_pos) |>
+  as.matrix()
+
+# Row annotation showing HIV status
+anno_hiv_pos <- rowAnnotation(
+  hiv_pos = anno_simple(dta_clean$hiv_pos,
+    col = c("Yes" = "white", "No" = "black")
+  )
+)
+
+# Rows: participants clustered by their z-scored retinal profile.
+# Columns: retinal measures clustered by similarity.
+heatmap <- Heatmap(
+  retinal_matrix,
+  name = "Retinal Parameters",
+  row_names_side = "left",
+  column_names_side = "bottom",
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  right_annotation = anno_hiv_pos,
+  col = colorRamp2(c(-3, 0, 3), c("blue", "white", "black")),
+  clustering_distance_rows = "euclidean",
+  clustering_method_rows = "complete",
+  clustering_distance_columns = "euclidean",
+  clustering_method_columns = "complete"
+)
+
+draw(heatmap)
+
+png("hierarchical_1.png", width = 10, height = 8, units = "in", res = 300)
+draw(heatmap)
+dev.off() # Close the PNG device
+```
+
+### ART status
+
+```{r}
+#| label: cluster-art
+dta_clean <- dta |>
+  filter(!is.na(on_art)) |>
+  select(study_id, on_art, all_of(retinal_var)) |>
+  mutate(across(all_of(retinal_var), scale))
+
+retinal_matrix <- dta_clean |>
+  column_to_rownames(var = "study_id") |>
+  select(-on_art) |>
+  as.matrix()
+
+anno_on_art <- rowAnnotation(
+  on_art = anno_simple(dta_clean$on_art,
+    col = c("Yes" = "green", "No" = "purple")
+  )
+)
+
+heatmap <- Heatmap(
+  retinal_matrix,
+  name = "Retinal Parameters",
+  row_names_side = "left",
+  column_names_side = "bottom",
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  right_annotation = anno_on_art,
+  col = colorRamp2(c(-3, 0, 3), c("blue", "white", "red")),
+  clustering_distance_rows = "euclidean",
+  clustering_method_rows = "complete",
+  clustering_distance_columns = "euclidean",
+  clustering_method_columns = "complete"
+)
+
+draw(heatmap)
+```
+
+### Gender
+
+```{r}
+#| label: cluster-gender
+dta_standard <- dta |>
+  select(study_id, gender, all_of(retinal_var)) |>
+  mutate(across(all_of(retinal_var), scale))
+
+retinal_matrix <- dta_standard |>
+  column_to_rownames(var = "study_id") |>
+  select(-gender) |>
+  as.matrix()
+
+anno_hiv_pos <- rowAnnotation(
+  hiv_pos = anno_simple(dta_standard$gender,
+    col = c("Female" = "red", "Male" = "blue")
+  )
+)
+
+heatmap <- Heatmap(
+  retinal_matrix,
+  name = "Retinal Parameters",
+  row_names_side = "left",
+  column_names_side = "bottom",
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  right_annotation = anno_hiv_pos,
+  col = colorRamp2(c(-3, 0, 3), c("green", "white", "purple")),
+  clustering_distance_rows = "euclidean",
+  clustering_method_rows = "complete",
+  clustering_distance_columns = "euclidean",
+  clustering_method_columns = "complete"
+)
+
+draw(heatmap)
+
+# Euclidean distance between participants; complete linkage merges clusters
+# by their largest pairwise distance
+```
+
+### HIV status, ART status and gender
+
+```{r}
+#| label: cluster-hiv-art-gender
+dta_clean <- dta |>
+  select(study_id, hiv_pos, gender, on_art, all_of(retinal_var)) |>
+  mutate(across(all_of(retinal_var), scale)) |>
+  column_to_rownames(var = "study_id")
+
+retinal_matrix <- dta_clean |>
+  select(-hiv_pos, -gender, -on_art) |>
+  as.matrix()
+
+anno_hiv_pos <- anno_simple(dta_clean$hiv_pos,
+  col = c("Yes" = "red", "No" = "blue"),
+  which = "row"
+)
+anno_gender <- anno_simple(dta_clean$gender,
+  col = c("Female" = "pink", "Male" = "green"),
+  which = "row"
+)
+anno_on_art <- anno_simple(dta_clean$on_art,
+  col = c("Yes" = "purple", "No" = "black", "NA" = "white"),
+  which = "row"
+)
+
+combined_annotation <- rowAnnotation(
+  hiv_pos = anno_hiv_pos,
+  sex = anno_gender,
+  on_art = anno_on_art
+)
+
+heatmap <- Heatmap(
+  retinal_matrix,
+  name = "Retinal Parameters",
+  row_names_side = "left",
+  column_names_side = "bottom",
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  right_annotation = combined_annotation,
+  col = colorRamp2(c(-3, 0, 3), c("blue", "white", "red")),
+  clustering_distance_rows = "euclidean",
+  clustering_method_rows = "complete",
+  clustering_distance_columns = "euclidean",
+  clustering_method_columns = "complete"
+)
+
+draw(heatmap)
+
+# Save the heatmap as a high-resolution PNG
+png("hierarchical_1.png", units = "in", res = 300)
+draw(heatmap)
+dev.off() # Close the PNG device
+
+heatmap <- Heatmap(
+  retinal_matrix,
+  name = "Retinal Parameters",
+  row_names_side = "left",
+  column_names_side = "bottom",
+  cluster_rows = FALSE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  right_annotation = combined_annotation,
+  col = colorRamp2(c(-3, 0, 3), c("blue", "white", "red")),
+  clustering_distance_rows = "euclidean",
+  clustering_method_rows = "complete",
+  clustering_distance_columns = "euclidean",
+  clustering_method_columns = "complete"
+)
+
+draw(heatmap)
+```
+
+### HIV status: t-test significant variables
+
+```{r}
+#| label: cluster-hiv-sig
+# Variables that differed by HIV status in the t-tests, entered by hand
+t_sig_var_hiv <- c(
+  "mdrd_egfr", "ggt", "ckd_epi_egfr", "bmi", "crve", "urine_creatinine",
+  "haemoglobin", "acr_ratio", "creatinine", "venule_branch_larger_branch",
+  "venule_branch_parent_width", "skeleton_fractal_analysis", "waist_hip_ratio"
+)
+
+dta_clean <- dta |>
+  select(
+    study_id, hiv_pos, gender, on_art, cvd_risk_factor, all_of(t_sig_var_hiv)
+  ) |>
+  mutate(across(all_of(t_sig_var_hiv), scale)) |>
+  column_to_rownames(var = "study_id")
+
+dta_clean <- dta_clean |>
+  arrange(hiv_pos, on_art, gender, cvd_risk_factor) |>
+  as.data.frame()
+
+retinal_matrix <- dta_clean |>
+  select(-hiv_pos, -gender, -on_art, -cvd_risk_factor) |>
+  as.matrix()
+
+anno_hiv_pos <- anno_simple(dta_clean$hiv_pos,
+  col = c("Yes" = "red", "No" = "blue"),
+  which = "row"
+)
+anno_cvd <- anno_simple(dta_clean$cvd_risk_factor,
+  col = c("Yes" = "pink", "No" = "black"),
+  which = "row"
+)
+anno_gender <- anno_simple(dta_clean$gender,
+  col = c("Female" = "yellow", "Male" = "green"),
+  which = "row"
+)
+anno_on_art <- anno_simple(dta_clean$on_art,
+  col = c("Yes" = "purple", "No" = "orange", "NA" = "black"),
+  which = "row"
+)
+
+combined_annotation <- rowAnnotation(
+  hiv_pos = anno_hiv_pos,
+  cvd_risk_factor = anno_cvd,
+  gender = anno_gender,
+  on_art = anno_on_art
+)
+
+heatmap <- Heatmap(
+  retinal_matrix,
+  name = "Retinal Parameters",
+  row_names_side = "left",
+  column_names_side = "bottom",
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  left_annotation = combined_annotation,
+  col = colorRamp2(c(-3, 0, 3), c("blue", "white", "red")),
+  clustering_distance_rows = "euclidean",
+  clustering_method_rows = "complete",
+  clustering_distance_columns = "euclidean",
+  clustering_method_columns = "complete"
+)
+
+draw(heatmap)
+
+# Save the heatmap as a high-resolution PNG
+png("hierarchical_2.png", width = 10, height = 8, units = "in", res = 300)
+draw(heatmap)
+dev.off() # Close the PNG device
+
+heatmap <- Heatmap(
+  retinal_matrix,
+  name = "Retinal Parameters",
+  row_names_side = "left",
+  column_names_side = "bottom",
+  cluster_rows = FALSE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  left_annotation = combined_annotation,
+  col = colorRamp2(c(-3, 0, 3), c("blue", "white", "red")),
+  clustering_distance_rows = "euclidean",
+  clustering_method_rows = "complete",
+  clustering_distance_columns = "euclidean",
+  clustering_method_columns = "complete"
+)
+
+draw(heatmap)
+```
+
+### ART status: t-test significant variables
+
+```{r}
+#| label: cluster-art-sig
+# Variables that differed by ART status in the t-tests, entered by hand
+t_sig_var_art <- c(
+  "fourier_fractal_enhanced", "branch_segment_length_kurtosis", "ggt",
+  "total_cholesterol", "ten_year_cvd_risk", "age", "segmented_fractal_analysis",
+  "hdl", "acr_ratio", "vascular_age", "ldl", "venule_mean_angular_asymmetry"
+)
+
+dta_clean <- dta |>
+  select(
+    study_id, hiv_pos, gender, on_art, cvd_risk_factor, all_of(t_sig_var_art)
+  ) |>
+  mutate(across(all_of(t_sig_var_art), scale)) |>
+  column_to_rownames(var = "study_id")
+
+dta_clean <- dta_clean |>
+  arrange(hiv_pos, on_art, gender, cvd_risk_factor) |>
+  as.data.frame()
+
+retinal_matrix <- dta_clean |>
+  select(-hiv_pos, -gender, -on_art, -cvd_risk_factor) |>
+  as.matrix()
+
+anno_hiv_pos <- anno_simple(dta_clean$hiv_pos,
+  col = c("Yes" = "red", "No" = "blue"),
+  which = "row"
+)
+anno_cvd <- anno_simple(dta_clean$cvd_risk_factor,
+  col = c("Yes" = "pink", "No" = "black"),
+  which = "row"
+)
+anno_gender <- anno_simple(dta_clean$gender,
+  col = c("Female" = "yellow", "Male" = "green"),
+  which = "row"
+)
+anno_on_art <- anno_simple(dta_clean$on_art,
+  col = c("Yes" = "purple", "No" = "orange", "NA" = "black"),
+  which = "row"
+)
+
+combined_annotation <- rowAnnotation(
+  hiv_pos = anno_hiv_pos,
+  cvd_risk_factor = anno_cvd,
+  gender = anno_gender,
+  on_art = anno_on_art
+)
+
+heatmap <- Heatmap(
+  retinal_matrix,
+  name = "Retinal Parameters",
+  row_names_side = "left",
+  column_names_side = "bottom",
+  cluster_rows = FALSE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  left_annotation = combined_annotation,
+  col = colorRamp2(c(-3, 0, 3), c("blue", "white", "red")),
+  clustering_distance_rows = "euclidean",
+  clustering_method_rows = "complete",
+  clustering_distance_columns = "euclidean",
+  clustering_method_columns = "complete"
+)
+
+draw(heatmap)
+
+heatmap <- Heatmap(
+  retinal_matrix,
+  name = "Retinal Parameters",
+  row_names_side = "left",
+  column_names_side = "bottom",
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  left_annotation = combined_annotation,
+  col = colorRamp2(c(-3, 0, 3), c("blue", "white", "red")),
+  clustering_distance_rows = "euclidean",
+  clustering_method_rows = "complete",
+  clustering_distance_columns = "euclidean",
+  clustering_method_columns = "complete"
+)
+
+draw(heatmap)
+```
+
+:::
+
+## Principal component analysis
+
+PCA with base R `prcomp()` (centred and scaled) on retinal, clinical and combined variable sets. Points are coloured by group, and PC1 is compared between groups with t-tests and Wilcoxon tests.
+
+::: panel-tabset
+
+### HIV and ART status: retinal
+
+```{r}
+#| label: pca-hiv-art-retinal
+# PCA (centred and scaled) on participants with complete data, coloured by
+# group. PC1 is then compared between groups.
+pca_dta <- dta |>
+  select(hiv_pos, on_art, all_of(retinal_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(retinal_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(retinal_var))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, hiv_pos)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+pca_plot <- ggplot(pca_meta, aes(x = PC1, y = PC2, color = on_art)) +
+  geom_point(size = 4) +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+ggsave("pca_all_ret.svg", plot = pca_plot, width = 10, height = 8)
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = on_art, shape = hiv_pos)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+t_test_result <- t.test(PC1 ~ hiv_pos, data = pca_meta, var.equal = TRUE)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(PC1 ~ hiv_pos, data = pca_meta)
+
+print(wilcox_test_result)
+
+pca_meta <- pca_meta |>
+  filter(on_art != "HIV negative")
+
+t_test_result <- t.test(PC1 ~ on_art, data = pca_meta, var.equal = TRUE)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(PC1 ~ on_art, data = pca_meta)
+
+print(wilcox_test_result)
+```
+
+### ART duration: retinal
+
+```{r}
+#| label: pca-art-duration-retinal
+pca_dta <- dta |>
+  select(art_duration_group, all_of(retinal_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(retinal_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(retinal_var))
+
+metadata <- filtered_pca_dta |>
+  select(art_duration_group)
+
+metadata <- metadata |>
+  mutate(art_duration_group = factor(
+    art_duration_group,
+    levels = c(
+      "Less than a year", "Not on ART or HIV neg", "1-5 years",
+      "More than 5 years"
+    ),
+    labels = c(
+      "Less than a year", "Not on ART or HIV neg", "1-5 years",
+      "More than 5 years"
+    )
+  ))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = art_duration_group, shape = art_duration_group)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = color_map_list) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = art_duration_group, shape = art_duration_group)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = color_map_list) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+# Two ART duration groups (0-5 vs more than 5 years): compare PC1
+pca_dta <- dta |>
+  select(art_duration_group_2, all_of(retinal_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(retinal_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(retinal_var))
+
+metadata <- filtered_pca_dta |>
+  select(art_duration_group_2)
+
+metadata <- metadata |>
+  mutate(art_duration_group_2 = factor(
+    art_duration_group_2,
+    levels = c("0-5 years", "More than 5 years"),
+    labels = c("Less than 5 years", "More than 5 years")
+  ))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+t_test_result <- t.test(
+  PC1 ~ art_duration_group_2,
+  data = pca_meta,
+  var.equal = TRUE
+)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(PC1 ~ art_duration_group_2, data = pca_meta)
+
+print(wilcox_test_result)
+```
+
+### Viral load: retinal
+
+```{r}
+#| label: pca-viral-load-retinal
+pca_dta <- dta |>
+  select(viral_load_group, all_of(retinal_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(retinal_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(retinal_var))
+
+metadata <- filtered_pca_dta |>
+  select(viral_load_group)
+
+metadata <- metadata |>
+  mutate(viral_load_group = factor(
+    viral_load_group,
+    levels = c("Viral load < 1000", "Viral load > 1000", "NA"),
+    labels = c("Viral load < 1000", "Viral load > 1000", "NA"),
+  ))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = viral_load_group, shape = viral_load_group)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = color_map_list) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = viral_load_group, shape = viral_load_group)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = color_map_list) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+t_test_result <- t.test(
+  PC1 ~ viral_load_group,
+  data = pca_meta,
+  var.equal = TRUE
+)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(PC1 ~ viral_load_group, data = pca_meta)
+
+print(wilcox_test_result)
+```
+
+### Age group and ART status: retinal
+
+```{r}
+#| label: pca-age-art-retinal
+pca_dta <- dta |>
+  select(age_group, on_art, all_of(retinal_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(retinal_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(retinal_var))
+
+metadata <- filtered_pca_dta |>
+  select(age_group, on_art)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(pca_meta, aes(x = PC1, y = PC2, color = age_group, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal()
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = age_group, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+```
+
+### Smoking and ART status: retinal
+
+```{r}
+#| label: pca-smoking-art-retinal
+pca_dta <- dta |>
+  select(smoker, on_art, all_of(retinal_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(retinal_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(retinal_var))
+
+metadata <- filtered_pca_dta |>
+  select(smoker, on_art)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(pca_meta, aes(x = PC1, y = PC2, color = smoker, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal()
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = smoker, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+# Smoker yes/no: compare PC1
+pca_dta <- dta |>
+  select(smoker_new, on_art, all_of(retinal_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(retinal_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(retinal_var))
+
+metadata <- filtered_pca_dta |>
+  select(smoker_new, on_art)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+t_test_result <- t.test(PC1 ~ smoker_new, data = pca_meta, var.equal = TRUE)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(PC1 ~ smoker_new, data = pca_meta)
+
+print(wilcox_test_result)
+```
+
+### CVD risk factor and HIV status: retinal
+
+```{r}
+#| label: pca-cvd-hiv-retinal
+pca_dta <- dta |>
+  select(cvd_risk_factor, on_art, all_of(retinal_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(retinal_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(retinal_var))
+
+metadata <- filtered_pca_dta |>
+  select(cvd_risk_factor, on_art)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = cvd_risk_factor, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = cvd_risk_factor, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+t_test_result <- t.test(
+  PC1 ~ cvd_risk_factor,
+  data = pca_meta,
+  var.equal = TRUE
+)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(PC1 ~ cvd_risk_factor, data = pca_meta)
+
+print(wilcox_test_result)
+```
+
+### HIV status: significant variables
+
+```{r}
+#| label: pca-hiv-sig
+pca_dta <- dta |>
+  select(hiv_pos, gender, on_art, all_of(t_sig_var_hiv))
+
+complete_rows <- complete.cases(pca_dta |> select(all_of(t_sig_var_hiv)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(t_sig_var_hiv))
+
+metadata <- filtered_pca_dta |>
+  select(hiv_pos, gender, on_art)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+pca_plot <- ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = hiv_pos, shape = on_art, linetype = gender)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+ggsave("pca_HIV_sig_var.svg", plot = pca_plot, width = 10, height = 8)
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = hiv_pos, shape = on_art, linetype = gender)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC2, y = PC8, color = hiv_pos, shape = on_art, linetype = gender)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC2 vs PC8",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC12, y = PC13, color = hiv_pos, shape = on_art, linetype = gender)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC2 vs PC8",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+pca_scores <- as.data.frame(pca_result$x)
+
+pca_meta <- cbind(pca_scores, metadata)
+
+datatable(pca_meta) |>
+  formatStyle(
+    columns = c(
+      "hiv_pos", "gender", "on_art", "PC1", "PC2", "PC3", "PC4", "PC5", "PC6",
+      "PC7", "PC8", "PC9", "PC10", "PC11", "PC12", "PC13"
+    ),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "#DFF8EB"
+  )
+datatable(pca_meta,
+  options = list(pageLength = 10, autoWidth = TRUE),
+  rownames = FALSE
+)
+
+pca_result
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+t_test_result <- t.test(PC1 ~ hiv_pos, data = pca_meta, var.equal = TRUE)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(PC1 ~ hiv_pos, data = pca_meta)
+
+print(wilcox_test_result)
+```
+
+### HIV status: significant retinal variables
+
+```{r}
+#| label: pca-hiv-sig-retinal
+pca_dta <- dta |>
+  select(
+    hiv_pos, gender, on_art, venule_branch_parent_width,
+    skeleton_fractal_analysis, venule_branch_larger_branch, crve
+  )
+
+complete_rows <- complete.cases(pca_dta |> select(
+  venule_branch_parent_width, skeleton_fractal_analysis,
+  venule_branch_larger_branch, crve
+))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(
+    venule_branch_parent_width, skeleton_fractal_analysis,
+    venule_branch_larger_branch, crve
+  )
+
+metadata <- filtered_pca_dta |>
+  select(hiv_pos, gender, on_art)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = hiv_pos, shape = on_art, linetype = gender)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = hiv_pos, shape = on_art, linetype = gender)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = on_art, shape = hiv_pos, linetype = gender)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = on_art, shape = hiv_pos, linetype = gender)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+t_test_result <- t.test(PC1 ~ hiv_pos, data = pca_meta, var.equal = TRUE)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(PC1 ~ hiv_pos, data = pca_meta)
+
+print(wilcox_test_result)
+```
+
+### ART status: significant variables
+
+```{r}
+#| label: pca-art-sig
+pca_dta <- dta |>
+  select(on_art, all_of(t_sig_var_art)) |>
+  filter((!is.na(on_art)))
+
+complete_rows <- complete.cases(pca_dta |> select(all_of(t_sig_var_art)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(t_sig_var_art))
+
+metadata <- filtered_pca_dta |>
+  select(on_art)
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+pca_plot <- ggplot(pca_meta, aes(x = PC1, y = PC2, color = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c("Yes" = "red", "No" = "blue")) +
+  theme_minimal()
+
+ggsave("pca_ART_sig.svg", plot = pca_plot, width = 10, height = 8)
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c("Yes" = "red", "No" = "blue")) +
+  theme_minimal()
+
+ggplot(pca_meta, aes(x = PC3, y = PC6, color = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c("Yes" = "red", "No" = "blue")) +
+  theme_minimal()
+
+datatable(pca_meta) |>
+  formatStyle(
+    columns = c(
+      "on_art", "PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8", "PC9",
+      "PC10", "PC11", "PC12"
+    ),
+    fontSize = "12px",
+    color = "black",
+    backgroundColor = "#DFF8EB"
+  )
+datatable(pca_meta,
+  options = list(pageLength = 10, autoWidth = TRUE),
+  rownames = FALSE
+)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+t_test_result <- t.test(PC1 ~ on_art, data = pca_meta, var.equal = TRUE)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(PC1 ~ on_art, data = pca_meta)
+
+print(wilcox_test_result)
+```
+
+### ART status: significant retinal variables
+
+```{r}
+#| label: pca-art-sig-retinal
+pca_dta <- dta |>
+  select(
+    on_art, fourier_fractal_enhanced, branch_segment_length_kurtosis,
+    venule_mean_angular_asymmetry, segmented_fractal_analysis
+  ) |>
+  filter((!is.na(on_art)))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(
+    fourier_fractal_enhanced, branch_segment_length_kurtosis,
+    venule_mean_angular_asymmetry, segmented_fractal_analysis
+  ))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(
+    fourier_fractal_enhanced, branch_segment_length_kurtosis,
+    venule_mean_angular_asymmetry, segmented_fractal_analysis
+  )
+
+metadata <- filtered_pca_dta |>
+  select(on_art)
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+pca_plot <- ggplot(pca_meta, aes(x = PC1, y = PC2, color = on_art)) +
+  geom_point(size = 4) +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c("Yes" = "red", "No" = "blue")) +
+  theme_minimal()
+
+ggsave("pca_ret_sig.svg", plot = pca_plot, width = 10, height = 8)
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c("Yes" = "red", "No" = "blue")) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+t_test_result <- t.test(PC1 ~ on_art, data = pca_meta, var.equal = TRUE)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(PC1 ~ on_art, data = pca_meta)
+
+print(wilcox_test_result)
+```
+
+### HIV and ART status: clinical
+
+```{r}
+#| label: pca-hiv-art-clinical
+pca_dta <- dta |>
+  select(hiv_pos, on_art, all_of(clinical_var_pca))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(clinical_var_pca)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(clinical_var_pca))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, hiv_pos)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(pca_meta, aes(x = PC1, y = PC2, color = on_art, shape = hiv_pos)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = on_art, shape = hiv_pos)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+```
+
+### Age group and ART status: clinical
+
+```{r}
+#| label: pca-age-art-clinical
+pca_dta <- dta |>
+  select(age_group, on_art, all_of(clinical_var_pca))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(clinical_var_pca)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(clinical_var_pca))
+
+metadata <- filtered_pca_dta |>
+  select(age_group, on_art)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(pca_meta, aes(x = PC1, y = PC2, color = age_group, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal()
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = age_group, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  theme_minimal()
+
+pca_result
+```
+
+### Smoking and HIV status: clinical
+
+```{r}
+#| label: pca-smoking-hiv-clinical
+pca_dta <- dta |>
+  select(smoker, on_art, all_of(clinical_var_pca))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(clinical_var_pca)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(clinical_var_pca))
+
+metadata <- filtered_pca_dta |>
+  select(smoker, on_art)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(pca_meta, aes(x = PC1, y = PC2, color = on_art, shape = smoker)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal()
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = on_art, shape = smoker)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  theme_minimal()
+
+pca_result
+```
+
+### CVD risk factor and HIV status: clinical
+
+```{r}
+#| label: pca-cvd-hiv-clinical
+pca_dta <- dta |>
+  select(cvd_risk_factor, on_art, all_of(clinical_var_pca))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(clinical_var_pca)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(clinical_var_pca))
+
+metadata <- filtered_pca_dta |>
+  select(cvd_risk_factor, on_art)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = on_art, shape = cvd_risk_factor)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = on_art, shape = cvd_risk_factor)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  theme_minimal()
+
+pca_result
+```
+
+### HIV and ART status: all variables
+
+```{r}
+#| label: pca-hiv-art-all
+pca_dta <- dta |>
+  select(hiv_pos, on_art, all_of(all_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(all_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(all_var))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, hiv_pos)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(pca_meta, aes(x = PC1, y = PC2, color = on_art, shape = hiv_pos)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = on_art, shape = hiv_pos)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "HIV negative" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+```
+
+### Age group and HIV status: all variables
+
+```{r}
+#| label: pca-age-hiv-all
+pca_dta <- dta |>
+  select(age_group, on_art, all_of(all_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(all_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(all_var))
+
+metadata <- filtered_pca_dta |>
+  select(age_group, on_art)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(pca_meta, aes(x = PC1, y = PC2, color = age_group, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal()
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = age_group, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  theme_minimal()
+
+pca_result
+```
+
+### Smoking and HIV status: all variables
+
+```{r}
+#| label: pca-smoking-hiv-all
+pca_dta <- dta |>
+  select(smoker, on_art, all_of(all_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(all_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(all_var))
+
+metadata <- filtered_pca_dta |>
+  select(smoker, on_art)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(pca_meta, aes(x = PC1, y = PC2, color = on_art, shape = smoker)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal()
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = on_art, shape = smoker)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  theme_minimal()
+
+pca_result
+```
+
+### CVD risk factor and HIV status: all variables
+
+```{r}
+#| label: pca-cvd-hiv-all
+pca_dta <- dta |>
+  select(cvd_risk_factor, on_art, all_of(all_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(all_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(all_var))
+
+metadata <- filtered_pca_dta |>
+  select(cvd_risk_factor, on_art)
+
+metadata <- metadata |>
+  mutate(on_art = ifelse(is.na(on_art), "HIV negative", on_art))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = on_art, shape = cvd_risk_factor)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = on_art, shape = cvd_risk_factor)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  theme_minimal()
+
+pca_result
+```
+
+### ART line and viral load: all variables
+
+```{r}
+#| label: pca-art-line-viral-load-all
+pca_dta <- dta |>
+  select(art_line, viral_load_group, all_of(all_var))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(all_var)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(all_var))
+
+metadata <- filtered_pca_dta |>
+  select(art_line, viral_load_group)
+
+metadata <- metadata |>
+  mutate(
+    art_line = ifelse(is.na(art_line), "HIV negative", art_line),
+    viral_load_group = ifelse(
+      is.na(viral_load_group), "HIV negative", viral_load_group
+    )
+  )
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = viral_load_group, shape = art_line)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = viral_load_group, shape = art_line)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  theme_minimal()
+
+pca_result
+```
+
+### ART duration: significant retinal variables
+
+```{r}
+#| label: pca-art-duration-sig-retinal
+pca_dta <- dta |>
+  select(art_duration_group, on_art, all_of(sig_art_duration_ret))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(sig_art_duration_ret)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(sig_art_duration_ret))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, art_duration_group)
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = art_duration_group, shape = art_duration_group)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c(
+    "1-5 years" = "red",
+    "More than 5 years" = "blue",
+    "Less than a year" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = art_duration_group, shape = art_duration_group)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "1-5 years" = "red",
+    "More than 5 years" = "blue",
+    "Less than a year" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+# Two ART duration groups (0-5 vs more than 5 years): compare PC1
+
+pca_dta <- dta |>
+  select(art_duration_group_2, on_art, all_of(sig_art_duration_ret))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(sig_art_duration_ret)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(sig_art_duration_ret))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, art_duration_group_2)
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+t_test_result <- t.test(
+  PC1 ~ art_duration_group_2,
+  data = pca_meta,
+  var.equal = TRUE
+)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(PC1 ~ art_duration_group_2, data = pca_meta)
+
+print(wilcox_test_result)
+```
+
+### CD4 count (clinic): significant variables
+
+```{r}
+#| label: pca-cd4-clinic-sig
+pca_dta <- dta |>
+  select(cd_count_clinic_group, on_art, all_of(sig_clinic_cd_count))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(sig_clinic_cd_count)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(sig_clinic_cd_count))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, (cd_count_clinic_group))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = cd_count_clinic_group, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c(
+    "0-199" = "red",
+    "200-499" = "blue",
+    "500+" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = cd_count_clinic_group, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "0-199" = "red",
+    "200-499" = "blue",
+    "500+" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+# Two CD4 count groups (below 500 vs 500+): compare PC1
+pca_dta <- dta |>
+  select(cd_count_clinic_group_2, on_art, all_of(sig_clinic_cd_count))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(sig_clinic_cd_count)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(sig_clinic_cd_count))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, (cd_count_clinic_group_2))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+t_test_result <- t.test(
+  PC1 ~ cd_count_clinic_group_2,
+  data = pca_meta,
+  var.equal = TRUE
+)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(
+  PC1 ~ cd_count_clinic_group_2,
+  data = pca_meta
+)
+
+print(wilcox_test_result)
+```
+
+### CD4 count (clinic): significant retinal variables
+
+```{r}
+#| label: pca-cd4-clinic-sig-retinal
+pca_dta <- dta |>
+  select(cd_count_clinic_group, on_art, all_of(sig_clinic_cd_count_ret))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(sig_clinic_cd_count_ret)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(sig_clinic_cd_count_ret))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, (cd_count_clinic_group))
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = cd_count_clinic_group, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c(
+    "0-199" = "red",
+    "200-499" = "blue",
+    "500+" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = cd_count_clinic_group, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "0-199" = "red",
+    "200-499" = "blue",
+    "500+" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+```
+
+### CD4 count (EndoAfrica): significant variables
+
+```{r}
+#| label: pca-cd4-endo-sig
+pca_dta <- dta |>
+  select(cd4_count_endo_group, on_art, all_of(sig_endo_result))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(sig_endo_result)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(sig_endo_result))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, cd4_count_endo_group)
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = cd4_count_endo_group, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "0-199" = "red",
+    "200-499" = "blue",
+    "500+" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = cd4_count_endo_group, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "0-199" = "red",
+    "200-499" = "blue",
+    "500+" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+```
+
+### CD4 count (EndoAfrica): significant retinal variables
+
+```{r}
+#| label: pca-cd4-endo-sig-retinal
+pca_dta <- dta |>
+  select(cd4_count_endo_group, on_art, all_of(sig_endo_result_ret))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(sig_endo_result_ret)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(sig_endo_result_ret))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, cd4_count_endo_group)
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = cd4_count_endo_group, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "0-199" = "red",
+    "200-499" = "blue",
+    "500+" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = cd4_count_endo_group, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "0-199" = "red",
+    "200-499" = "blue",
+    "500+" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+```
+
+### Hypertension: significant variables
+
+```{r}
+#| label: pca-hypertension-sig
+pca_dta <- dta |>
+  select(hypertension, on_art, all_of(sig_hypertension))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(sig_hypertension)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(sig_hypertension))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, hypertension)
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(pca_meta, aes(x = PC1, y = PC2, color = hypertension, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "500+" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = hypertension, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes" = "red",
+    "No" = "blue",
+    "500+" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+```
+
+### Smoking: significant variables
+
+```{r}
+#| label: pca-smoking-sig
+pca_dta <- dta |>
+  select(smoker, on_art, all_of(sig_smoker))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(sig_smoker)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(sig_smoker))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, smoker)
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(pca_meta, aes(x = PC1, y = PC2, color = smoker, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes currently" = "red",
+    "In the past" = "blue",
+    "Never smoked" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = smoker, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes currently" = "red",
+    "In the past" = "blue",
+    "Never smoked" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+```
+
+### Smoking: significant retinal variables
+
+```{r}
+#| label: pca-smoking-sig-retinal
+pca_dta <- dta |>
+  select(smoker, on_art, all_of(sig_smoker_ret))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(sig_smoker_ret)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(sig_smoker_ret))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, smoker)
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(pca_meta, aes(x = PC1, y = PC2, color = smoker, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes currently" = "red",
+    "In the past" = "blue",
+    "Never smoked" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(pca_meta, aes(x = PC3, y = PC4, color = smoker, shape = on_art)) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Yes currently" = "red",
+    "In the past" = "blue",
+    "Never smoked" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+```
+
+### Viral load: significant variables
+
+```{r}
+#| label: pca-viral-load-sig
+pca_dta <- dta |>
+  select(viral_load_group, on_art, all_of(sig_viral_load))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(sig_viral_load)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(sig_viral_load))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, viral_load_group)
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = viral_load_group, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c(
+    "Viral load > 1000" = "red",
+    "Viral load < 1000" = "blue",
+    "Never smoked" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = viral_load_group, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Viral load > 1000" = "red",
+    "Viral load < 1000" = "blue",
+    "Never smoked" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+```
+
+### Viral load: significant retinal variables
+
+```{r}
+#| label: pca-viral-load-sig-retinal
+pca_dta <- dta |>
+  select(viral_load_group, on_art, all_of(sig_viral_load_ret))
+
+complete_rows <- complete.cases(pca_dta |>
+  select(all_of(sig_viral_load_ret)))
+
+filtered_pca_dta <- pca_dta[complete_rows, ]
+
+numeric_data <- filtered_pca_dta |>
+  select(all_of(sig_viral_load_ret))
+
+metadata <- filtered_pca_dta |>
+  select(on_art, viral_load_group)
+
+pca_result <- prcomp(numeric_data, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x)
+pca_meta <- cbind(pca_scores, metadata)
+
+ggplot(
+  pca_meta,
+  aes(x = PC1, y = PC2, color = viral_load_group, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  scale_color_manual(values = c(
+    "Viral load > 1000" = "red",
+    "Viral load < 1000" = "blue",
+    "Never smoked" = "black"
+  )) +
+  theme_minimal()
+
+ggplot(
+  pca_meta,
+  aes(x = PC3, y = PC4, color = viral_load_group, shape = on_art)
+) +
+  geom_point() +
+  labs(
+    title = "PCA: PC3 vs PC4 ",
+    x = "Principal Component 3",
+    y = "Principal Component 4"
+  ) +
+  scale_color_manual(values = c(
+    "Viral load > 1000" = "red",
+    "Viral load < 1000" = "blue",
+    "Never smoked" = "black"
+  )) +
+  theme_minimal()
+
+pca_result
+
+sdev <- pca_result$sdev
+variance <- sdev^2
+variance_explained <- variance / sum(variance)
+print(variance_explained)
+
+screeplot_df <- data.frame(
+  PC = seq_along(pca_result$sdev),
+  Variance = pca_result$sdev^2,
+  Proportion = pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+ggplot(screeplot_df, aes(x = PC, y = Proportion)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Proportion of Variance Explained"
+  ) +
+  theme_minimal()
+
+t_test_result <- t.test(
+  PC1 ~ viral_load_group,
+  data = pca_meta,
+  var.equal = TRUE
+)
+
+print(t_test_result)
+
+wilcox_test_result <- wilcox.test(PC1 ~ viral_load_group, data = pca_meta)
+
+print(wilcox_test_result)
+```
+
+:::
+
+## Linear regression
+
+One linear model per retinal measure, with HIV status, ART status or another HIV-related variable as the predictor, adjusted for age, sex, BMI, smoking and (in most models) CVD risk factors.
+
+::: panel-tabset
+
+### HIV status
+
+```{r}
+#| label: lm-hiv
+# One linear model per retinal measure: HIV status plus covariates
+fit_model <- function(var) {
+  formula <- as.formula(paste(
+    var, "~ hiv_pos + age + gender + cvd_risk_factor + bmi + smoker"
+  ))
+  model <- lm(formula, data = dta_nums)
+
+  tidy(model) |>
+    mutate(
+      Adj_R_squared = summary(model)$adj.r.squared,
+      Model = var
+    )
+}
+
+dta_nums <- dta |>
+  select(
+    study_id, all_of(retinal_var), hiv_pos, age, gender, cvd_risk_factor, bmi,
+    smoker
+  )
+
+linear_results_table <- retinal_var |>
+  map_dfr(fit_model)
+
+results_df <- linear_results_table |>
+  filter(term != "(Intercept)") |>
+  select(Model, term, estimate, Adj_R_squared, std.error, statistic, p.value) |>
+  arrange(p.value)
+
+datatable(results_df) |>
+  formatStyle(
+    columns = c(
+      "Model", "term", "Adj_R_squared", "estimate", "std.error", "statistic",
+      "p.value"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "#FFFFFF"
+  ) |>
+  formatRound(
+    columns = c(
+      "Adj_R_squared", "estimate", "std.error", "statistic", "p.value"
+    ),
+    digits = 4
+  )
+```
+
+### HIV status: plots
+
+```{r}
+#| label: lm-hiv-plots
+# Observed vs predicted values from the adjusted model
+plot_regression_line <- function(data, vars, angle = 45) {
+  data <- dta |>
+    select(all_of(c(
+      vars, "hiv_pos", "age", "gender", "cvd_risk_factor", "bmi", "smoker"
+    ))) |>
+    drop_na()
+
+  formula <- as.formula(paste(
+    vars, "~ hiv_pos + age + gender + cvd_risk_factor + bmi + smoker"
+  ))
+
+  model <- lm(formula, data = dta)
+
+  data$predicted <- predict(model, newdata = data)
+
+  p <- ggplot(data, aes_string(x = vars, y = "predicted")) +
+    geom_point(aes(color = "Data Points")) +
+    geom_smooth(method = "lm", se = FALSE, color = "blue") +
+    labs(
+      title = paste("Regression Line for", vars),
+      x = vars,
+      y = "Predicted Values"
+    ) +
+    theme(axis.text.x = element_text(angle = angle, hjust = 1))
+
+  return(p)
+}
+
+for (var in retinal_var) {
+  plot_regression_line(data = dta_nums, vars = var, angle = 45) |>
+    print()
+}
+```
+
+### ART status
+
+```{r}
+#| label: lm-art
+# One linear model per retinal measure: ART status plus covariates
+# (rows with missing on_art, i.e. HIV-negative participants, are dropped)
+dta_nums <- dta |>
+  select(
+    study_id, all_of(retinal_var), on_art, age, gender, cvd_risk_factor, bmi,
+    smoker
+  )
+
+fit_model <- function(var) {
+  formula <- as.formula(paste(
+    var, "~ on_art + age + gender + cvd_risk_factor + bmi + smoker"
+  ))
+  model <- lm(formula, data = dta_nums)
+
+  tidy(model) |>
+    mutate(
+      Adj_R_squared = summary(model)$adj.r.squared,
+      Model = var
+    )
+}
+
+dta_nums <- dta |>
+  select(
+    study_id, all_of(retinal_var), on_art, age, gender, cvd_risk_factor, bmi,
+    smoker
+  ) |>
+  drop_na()
+
+linear_results_table <- retinal_var |>
+  map_dfr(fit_model)
+
+results_df <- linear_results_table |>
+  filter(term != "(Intercept)") |>
+  select(Model, term, estimate, Adj_R_squared, std.error, statistic, p.value) |>
+  arrange(Model)
+
+datatable(results_df) |>
+  formatStyle(
+    columns = c(
+      "Model", "term", "Adj_R_squared", "estimate", "std.error", "statistic",
+      "p.value"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "#FFFFFF"
+  ) |>
+  formatRound(
+    columns = c(
+      "Adj_R_squared", "estimate", "std.error", "statistic", "p.value"
+    ),
+    digits = 4
+  )
+```
+
+### ART status and viral load group
+
+```{r}
+#| label: lm-art-viral-load
+dta_nums <- dta |>
+  select(
+    study_id, all_of(retinal_var), on_art, age, gender, bmi, smoker,
+    viral_load_group
+  )
+
+fit_model <- function(var) {
+  formula <- as.formula(paste(
+    var, "~ on_art + age + gender +  bmi + smoker + viral_load_group"
+  ))
+  model <- lm(formula, data = dta_nums)
+
+  tidy(model) |>
+    mutate(
+      Adj_R_squared = summary(model)$adj.r.squared,
+      Model = var
+    )
+}
+
+dta_nums <- dta |>
+  select(
+    study_id, all_of(retinal_var), on_art, age, gender, bmi, smoker,
+    viral_load_group
+  ) |>
+  drop_na()
+
+linear_results_table <- retinal_var |>
+  map_dfr(fit_model)
+
+results_df <- linear_results_table |>
+  filter(term != "(Intercept)") |>
+  select(Model, term, estimate, Adj_R_squared, std.error, statistic, p.value) |>
+  arrange(Model)
+
+datatable(results_df) |>
+  formatStyle(
+    columns = c(
+      "Model", "term", "Adj_R_squared", "estimate", "std.error", "statistic",
+      "p.value"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "#FFFFFF"
+  ) |>
+  formatRound(
+    columns = c(
+      "Adj_R_squared", "estimate", "std.error", "statistic", "p.value"
+    ),
+    digits = 4
+  )
+```
+
+### ART status and CD4 count group
+
+```{r}
+#| label: lm-art-cd4
+dta_nums <- dta |>
+  select(
+    study_id, all_of(retinal_var), on_art, age, gender, bmi, smoker,
+    cd4_count_endo_group
+  )
+
+fit_model <- function(var) {
+  formula <- as.formula(paste(
+    var, "~ on_art + age + gender +  bmi + smoker + cd4_count_endo_group_2"
+  ))
+  model <- lm(formula, data = dta_nums)
+
+  tidy(model) |>
+    mutate(
+      Adj_R_squared = summary(model)$adj.r.squared,
+      Model = var
+    )
+}
+
+dta_nums <- dta |>
+  select(
+    study_id, all_of(retinal_var), on_art, age, gender, bmi, smoker,
+    cd4_count_endo_group
+  ) |>
+  drop_na()
+
+linear_results_table <- retinal_var |>
+  map_dfr(fit_model)
+
+results_df <- linear_results_table |>
+  filter(term != "(Intercept)") |>
+  select(Model, term, estimate, Adj_R_squared, std.error, statistic, p.value) |>
+  arrange(Model)
+
+datatable(results_df) |>
+  formatStyle(
+    columns = c(
+      "Model", "term", "Adj_R_squared", "estimate", "std.error", "statistic",
+      "p.value"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "#FFFFFF"
+  ) |>
+  formatRound(
+    columns = c(
+      "Adj_R_squared", "estimate", "std.error", "statistic", "p.value"
+    ),
+    digits = 4
+  )
+```
+
+### ART status: plots
+
+```{r}
+#| label: lm-art-plots
+# Observed vs predicted values from the adjusted model
+dta_nums <- dta |>
+  select(
+    study_id, all_of(retinal_var), on_art, age, gender, cvd_risk_factor, bmi,
+    smoker
+  )
+
+plot_regression_line <- function(data, vars, angle = 45) {
+  data <- dta |>
+    select(all_of(c(
+      vars, "on_art", "age", "gender", "cvd_risk_factor", "bmi", "smoker"
+    ))) |>
+    drop_na()
+
+  formula <- as.formula(paste(
+    vars, "~ on_art + age + gender + cvd_risk_factor + bmi + smoker"
+  ))
+
+  model <- lm(formula, data = dta)
+
+  data$predicted <- predict(model, newdata = data)
+
+  p <- ggplot(data, aes_string(x = vars, y = "predicted")) +
+    geom_point(aes(color = "Data Points")) +
+    geom_smooth(method = "lm", se = FALSE, color = "blue") +
+    labs(
+      title = paste("Regression Line for", vars),
+      x = vars,
+      y = "Predicted Values"
+    ) +
+    theme(axis.text.x = element_text(angle = angle, hjust = 1))
+
+  return(p)
+}
+
+for (var in retinal_var) {
+  plot_regression_line(data = dta_nums, vars = var, angle = 45) |>
+    print()
+}
+```
+
+### CD4 count (clinic)
+
+```{r}
+#| label: lm-cd4-clinic
+fit_model <- function(var) {
+  formula <- as.formula(paste(
+    var, "~ cd4_count_clinic +  age + gender + cvd_risk_factor + bmi + smoker"
+  ))
+  model <- lm(formula, data = dta_nums)
+
+  tidy(model) |>
+    mutate(
+      Adj_R_squared = summary(model)$adj.r.squared,
+      Model = var
+    )
+}
+
+dta_nums <- dta |>
+  select(
+    study_id, all_of(retinal_var), cd4_count_clinic, age, gender,
+    cvd_risk_factor, bmi, smoker
+  ) |>
+  drop_na()
+
+linear_results_table <- retinal_var |>
+  map_dfr(fit_model)
+
+results_df <- linear_results_table |>
+  filter(term != "(Intercept)") |>
+  select(Model, term, estimate, Adj_R_squared, std.error, statistic, p.value) |>
+  arrange(Model)
+
+datatable(results_df) |>
+  formatStyle(
+    columns = c(
+      "Model", "term", "Adj_R_squared", "estimate", "std.error", "statistic",
+      "p.value"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "#FFFFFF"
+  ) |>
+  formatRound(
+    columns = c(
+      "Adj_R_squared", "estimate", "std.error", "statistic", "p.value"
+    ),
+    digits = 4
+  )
+```
+
+### CD4 count (EndoAfrica)
+
+```{r}
+#| label: lm-cd4-endo
+fit_model <- function(var) {
+  formula <- as.formula(paste(
+    var, "~ endo_result +  age + gender + cvd_risk_factor + bmi + smoker"
+  ))
+  model <- lm(formula, data = dta_nums)
+
+  tidy(model) |>
+    mutate(
+      Adj_R_squared = summary(model)$adj.r.squared,
+      Model = var
+    )
+}
+
+dta_nums <- dta |>
+  select(
+    study_id, all_of(retinal_var), endo_result, age, gender, cvd_risk_factor,
+    bmi, smoker
+  ) |>
+  drop_na()
+
+linear_results_table <- retinal_var |>
+  map_dfr(fit_model)
+
+results_df <- linear_results_table |>
+  filter(term != "(Intercept)") |>
+  select(Model, term, estimate, Adj_R_squared, std.error, statistic, p.value) |>
+  arrange(Model)
+
+datatable(results_df) |>
+  formatStyle(
+    columns = c(
+      "Model", "term", "Adj_R_squared", "estimate", "std.error", "statistic",
+      "p.value"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "#FFFFFF"
+  ) |>
+  formatRound(
+    columns = c(
+      "Adj_R_squared", "estimate", "std.error", "statistic", "p.value"
+    ),
+    digits = 4
+  )
+```
+
+### ART duration group
+
+```{r}
+#| label: lm-art-duration
+fit_model <- function(var) {
+  formula <- as.formula(paste(
+    var, "~ art_duration_group + age + gender + cvd_risk_factor + bmi + smoker"
+  ))
+  model <- lm(formula, data = dta_nums)
+
+  tidy(model) |>
+    mutate(
+      Adj_R_squared = summary(model)$adj.r.squared,
+      Model = var
+    )
+}
+
+dta_nums <- dta |>
+  select(
+    study_id, all_of(retinal_var), art_duration_group, age, gender,
+    cvd_risk_factor, bmi, smoker
+  ) |>
+  drop_na()
+
+linear_results_table <- retinal_var |>
+  map_dfr(fit_model)
+
+results_df <- linear_results_table |>
+  filter(term != "(Intercept)") |>
+  select(Model, term, estimate, Adj_R_squared, std.error, statistic, p.value) |>
+  arrange(Model)
+
+datatable(results_df) |>
+  formatStyle(
+    columns = c(
+      "Model", "term", "Adj_R_squared", "estimate", "std.error", "statistic",
+      "p.value"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "#FFFFFF"
+  ) |>
+  formatRound(
+    columns = c(
+      "Adj_R_squared", "estimate", "std.error", "statistic", "p.value"
+    ),
+    digits = 4
+  )
+```
+
+### ART duration: plots
+
+```{r}
+#| label: lm-art-duration-plots
+# Observed vs predicted values from the adjusted model
+plot_regression_line <- function(data, vars, angle = 45) {
+  data <- dta |>
+    select(all_of(c(
+      vars, "art_duration_weeks", "age", "gender", "cvd_risk_factor", "bmi",
+      "smoker"
+    ))) |>
+    drop_na()
+
+  formula <- as.formula(paste(
+    vars,
+    "~ art_duration_weeks + age + gender + cvd_risk_factor + bmi + smoker"
+  ))
+
+  model <- lm(formula, data = dta)
+
+  data$predicted <- predict(model, newdata = data)
+
+  p <- ggplot(data, aes_string(x = vars, y = "predicted")) +
+    geom_point(aes(color = "Data Points")) +
+    geom_smooth(method = "lm", se = FALSE, color = "blue") +
+    labs(
+      title = paste("Regression Line for", vars),
+      x = vars,
+      y = "Predicted Values"
+    ) +
+    theme(axis.text.x = element_text(angle = angle, hjust = 1))
+
+  return(p)
+}
+
+for (var in retinal_var) {
+  plot_regression_line(data = dta_nums, vars = var, angle = 45) |>
+    print()
+}
+```
+
+### Viral load group
+
+```{r}
+#| label: lm-viral-load
+fit_model <- function(var) {
+  formula <- as.formula(paste(
+    var, "~ viral_load + age + gender + cvd_risk_factor + bmi + smoker"
+  ))
+  model <- lm(formula, data = dta_nums)
+
+  tidy(model) |>
+    mutate(
+      Adj_R_squared = summary(model)$adj.r.squared,
+      Model = var
+    )
+}
+
+dta_nums <- dta |>
+  select(
+    study_id, all_of(retinal_var), viral_load, age, gender, cvd_risk_factor,
+    bmi, smoker
+  ) |>
+  drop_na()
+
+linear_results_table <- retinal_var |>
+  map_dfr(fit_model)
+
+results_df <- linear_results_table |>
+  filter(term != "(Intercept)") |>
+  select(Model, term, estimate, Adj_R_squared, std.error, statistic, p.value) |>
+  arrange(Model)
+
+datatable(results_df) |>
+  formatStyle(
+    columns = c(
+      "Model", "term", "Adj_R_squared", "estimate", "std.error", "statistic",
+      "p.value"
+    ),
+    fontSize = "11px",
+    color = "black",
+    backgroundColor = "#FFFFFF"
+  ) |>
+  formatRound(
+    columns = c(
+      "Adj_R_squared", "estimate", "std.error", "statistic", "p.value"
+    ),
+    digits = 4
+  )
+```
+
+:::
+
+## Random forest and decision trees (exploratory)
+
+Exploratory classification of HIV and ART status from the retinal measures. These models were not part of the final report.
+
+::: panel-tabset
+
+### Initial model
+
+```{r}
+#| label: rf-initial
+dta_nums <- dta |>
+  select(study_id, hiv_pos, all_of(retinal_var)) |>
+  drop_na() |>
+  mutate(
+    hiv_pos = as.factor(hiv_pos)
+  )
+
+rf_model <- randomForest(
+  hiv_pos ~ crae + crve + crae_crve_ratio + segmented_fractal_analysis +
+    skeleton_fractal_analysis + average_arterial_tree_diameter +
+    arterial_tree_segments + branch_segment_tortuosity_skewness +
+    branch_segment_tortuosity_kurtosis + branch_segment_length_average +
+    arteriole_branch_parent_width + arteriole_branch_smaller_branch +
+    arteriole_branch_larger_branch + arteriole_branch_angle +
+    arteriole_branch_optimality + arteriole_mean_asymmetry_ratio +
+    arteriole_mean_angular_asymmetry + venule_branch_parent_width +
+    venule_branch_smaller_branch + venule_branch_larger_branch +
+    venule_branch_angle + venule_branch_optimality +
+    venule_mean_branching_coefficient + venule_mean_asymmetry_ratio +
+    venule_mean_angular_asymmetry,
+  data = dta_nums,
+  proximity = TRUE
+)
+
+rf_model
+
+# Print confusion matrix
+print(rf_model$confusion)
+
+# Print variable importance
+print(importance(rf_model))
+
+# Results from one run (no seed is set, so these numbers vary between runs):
+# OOB error rate 44.84%, i.e. about 45% of cases misclassified
+# true negatives = 24, false positives = 89
+# false negatives = 37, true positives = 131
+# 79% of actual "No" and 22% of actual "Yes" cases were misclassified
+# Variables with higher MeanDecreaseGini are more influential in predicting
+# hiv_pos
+```
+
+### Error rate by number of trees
+
+```{r}
+#| label: rf-error-by-trees
+num_trees <- 1:nrow(rf_model$err.rate)
+
+oob_error_1 <- data.frame(
+  trees = rep(num_trees, times = 3),
+  type = rep(c("OOB", "Yes", "No"), each = length(num_trees)),
+  Error = c(
+    rf_model$err.rate[, "OOB"], # Out-Of-Bag error
+    rf_model$err.rate[, "Yes"], # Error rate for "Yes" class
+    rf_model$err.rate[, "No"] # Error rate for "No" class
+  )
+)
+
+print(oob_error_1)
+
+# Error rates as trees are added to the forest
+ggplot(data = oob_error_1, aes(x = trees, y = Error)) +
+  geom_line(aes(color = type))
+```
+
+### Change number of trees (500 to 1000)
+
+```{r}
+#| label: rf-more-trees
+rf_model_2 <- randomForest(
+  hiv_pos ~ crae + crve + crae_crve_ratio + segmented_fractal_analysis +
+    skeleton_fractal_analysis + average_arterial_tree_diameter +
+    arterial_tree_segments + branch_segment_tortuosity_skewness +
+    branch_segment_tortuosity_kurtosis + branch_segment_length_average +
+    arteriole_branch_parent_width + arteriole_branch_smaller_branch +
+    arteriole_branch_larger_branch + arteriole_branch_angle +
+    arteriole_branch_optimality + arteriole_mean_asymmetry_ratio +
+    arteriole_mean_angular_asymmetry + venule_branch_parent_width +
+    venule_branch_smaller_branch + venule_branch_larger_branch +
+    venule_branch_angle + venule_branch_optimality +
+    venule_mean_branching_coefficient + venule_mean_asymmetry_ratio +
+    venule_mean_angular_asymmetry,
+  data = dta_nums,
+  ntrees = 1000,
+  proximity = TRUE
+)
+
+num_trees <- 1:nrow(rf_model_2$err.rate)
+
+oob_error_1 <- data.frame(
+  trees = rep(num_trees, times = 3),
+  type = rep(c("OOB", "Yes", "No"), each = length(num_trees)),
+  Error = c(
+    rf_model$err.rate[, "OOB"], # Out-Of-Bag error
+    rf_model$err.rate[, "Yes"], # Error rate for "Yes" class
+    rf_model$err.rate[, "No"] # Error rate for "No" class
+  )
+)
+ggplot(data = oob_error_1, aes(x = trees, y = Error)) +
+  geom_line(aes(color = type))
+```
+
+### Check number of variables used
+
+```{r}
+#| label: rf-check-variables
+oob_values <- vector(length = 10)
+for (i in 1:10) {
+  tmp <- randomForest(
+    hiv_pos ~ crae + crve + crae_crve_ratio + segmented_fractal_analysis +
+      skeleton_fractal_analysis + average_arterial_tree_diameter +
+      arterial_tree_segments + branch_segment_tortuosity_skewness +
+      branch_segment_tortuosity_kurtosis + branch_segment_length_average +
+      arteriole_branch_parent_width + arteriole_branch_smaller_branch +
+      arteriole_branch_larger_branch + arteriole_branch_angle +
+      arteriole_branch_optimality + arteriole_mean_asymmetry_ratio +
+      arteriole_mean_angular_asymmetry + venule_branch_parent_width +
+      venule_branch_smaller_branch + venule_branch_larger_branch +
+      venule_branch_angle + venule_branch_optimality +
+      venule_mean_branching_coefficient + venule_mean_asymmetry_ratio +
+      venule_mean_angular_asymmetry,
+    data = dta_nums,
+    proximity = TRUE
+  )
+  oob_values[i] <- tmp$err.rate[nrow(tmp$err.rate), 1]
+}
+
+# err.rate has one row per tree; the last row of the first column is the
+# final OOB error rate for each of the 10 fits
+oob_values
+```
+
+### HIV status: forest and decision tree
+
+```{r}
+#| label: rf-hiv
+dta_nums <- dta |>
+  select(study_id, hiv_pos, all_of(retinal_var)) |>
+  drop_na() |>
+  mutate(
+    hiv_pos = as.factor(hiv_pos)
+  )
+
+importance_list <- list()
+
+rf_model <- randomForest(
+  hiv_pos ~ crae + crve + crae_crve_ratio + segmented_fractal_analysis +
+    skeleton_fractal_analysis + average_arterial_tree_diameter +
+    arterial_tree_segments + branch_segment_tortuosity_skewness +
+    branch_segment_tortuosity_kurtosis + branch_segment_length_average +
+    arteriole_branch_parent_width + arteriole_branch_smaller_branch +
+    arteriole_branch_larger_branch + arteriole_branch_angle +
+    arteriole_branch_optimality + arteriole_mean_asymmetry_ratio +
+    arteriole_mean_angular_asymmetry + venule_branch_parent_width +
+    venule_branch_smaller_branch + venule_branch_larger_branch +
+    venule_branch_angle + venule_branch_optimality +
+    venule_mean_branching_coefficient + venule_mean_asymmetry_ratio +
+    venule_mean_angular_asymmetry,
+  data = dta_nums,
+  proximity = TRUE
+)
+
+importance_values <- importance(rf_model)
+importance_df <- as.data.frame(importance_values)
+importance_df$Feature <- rownames(importance_df)
+importance_df <- importance_df |>
+  rename(MeanDecreaseGini = MeanDecreaseGini)
+importance_df <- importance_df |>
+  arrange(desc(MeanDecreaseGini))
+print(importance_df)
+p <- ggplot(
+  importance_df,
+  aes(x = reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)
+) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(
+    title = "Feature Importance",
+    x = "Features",
+    y = "Importance (MeanDecreaseGini)"
+  ) +
+  theme_minimal()
+
+print(p)
+
+tree_model <- rpart(
+  hiv_pos ~ crae + crve + crae_crve_ratio + segmented_fractal_analysis +
+    skeleton_fractal_analysis + average_arterial_tree_diameter +
+    arterial_tree_segments + branch_segment_tortuosity_skewness +
+    branch_segment_tortuosity_kurtosis + branch_segment_length_average +
+    arteriole_branch_parent_width + arteriole_branch_smaller_branch +
+    arteriole_branch_larger_branch + arteriole_branch_angle +
+    arteriole_branch_optimality + arteriole_mean_asymmetry_ratio +
+    arteriole_mean_angular_asymmetry + venule_branch_parent_width +
+    venule_branch_smaller_branch + venule_branch_larger_branch +
+    venule_branch_angle + venule_branch_optimality +
+    venule_mean_branching_coefficient + venule_mean_asymmetry_ratio +
+    venule_mean_angular_asymmetry,
+  data = dta_nums,
+  method = "class"
+)
+
+rpart.plot(tree_model)
+```
+
+### ART status: forest and decision tree
+
+```{r}
+#| label: rf-art
+dta_nums <- dta |>
+  select(study_id, on_art, all_of(retinal_var)) |>
+  drop_na() |>
+  mutate(
+    on_art = as.factor(on_art)
+  )
+
+importance_list <- list()
+
+rf_model <- randomForest(
+  on_art ~ crae + crve + crae_crve_ratio + segmented_fractal_analysis +
+    skeleton_fractal_analysis + average_arterial_tree_diameter +
+    arterial_tree_segments + branch_segment_tortuosity_skewness +
+    branch_segment_tortuosity_kurtosis + branch_segment_length_average +
+    arteriole_branch_parent_width + arteriole_branch_smaller_branch +
+    arteriole_branch_larger_branch + arteriole_branch_angle +
+    arteriole_branch_optimality + arteriole_mean_asymmetry_ratio +
+    arteriole_mean_angular_asymmetry + venule_branch_parent_width +
+    venule_branch_smaller_branch + venule_branch_larger_branch +
+    venule_branch_angle + venule_branch_optimality +
+    venule_mean_branching_coefficient + venule_mean_asymmetry_ratio +
+    venule_mean_angular_asymmetry,
+  data = dta_nums,
+  proximity = TRUE
+)
+
+importance_values <- importance(rf_model)
+importance_df <- as.data.frame(importance_values)
+importance_df$Feature <- rownames(importance_df)
+importance_df <- importance_df |>
+  rename(MeanDecreaseGini = MeanDecreaseGini)
+importance_df <- importance_df |>
+  arrange(desc(MeanDecreaseGini))
+print(importance_df)
+p <- ggplot(
+  importance_df,
+  aes(x = reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)
+) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(
+    title = "Feature Importance",
+    x = "Features",
+    y = "Importance (MeanDecreaseGini)"
+  ) +
+  theme_minimal()
+
+print(p)
+
+tree_model_2 <- rpart(
+  on_art ~ crae + crve + crae_crve_ratio + segmented_fractal_analysis +
+    skeleton_fractal_analysis + average_arterial_tree_diameter +
+    arterial_tree_segments + branch_segment_tortuosity_skewness +
+    branch_segment_tortuosity_kurtosis + branch_segment_length_average +
+    arteriole_branch_parent_width + arteriole_branch_smaller_branch +
+    arteriole_branch_larger_branch + arteriole_branch_angle +
+    arteriole_branch_optimality + arteriole_mean_asymmetry_ratio +
+    arteriole_mean_angular_asymmetry + venule_branch_parent_width +
+    venule_branch_smaller_branch + venule_branch_larger_branch +
+    venule_branch_angle + venule_branch_optimality +
+    venule_mean_branching_coefficient + venule_mean_asymmetry_ratio +
+    venule_mean_angular_asymmetry,
+  data = dta_nums,
+  method = "class"
+)
+
+rpart.plot(tree_model_2)
+```
+
+:::
+
+## Random forest with a train/test split (exploratory)
+
+Exploratory check of prediction accuracy on a held-out 40% of participants. Not part of the final report.
+
+::: panel-tabset
+
+### HIV status: retinal variables
+
+```{r}
+#| label: rf-split-hiv-retinal
+dta_nums <- dta |>
+  select(study_id, hiv_pos, cvd_risk_factor, all_of(retinal_var)) |>
+  drop_na() |>
+  mutate(
+    hiv_pos = as.factor(hiv_pos)
+  )
+
+set.seed(123)
+
+trainIndex <- createDataPartition(dta_nums$hiv_pos, p = 0.6, list = FALSE)
+trainData <- dta_nums[trainIndex, ]
+testData <- dta_nums[-trainIndex, ]
+
+rf_model <- randomForest(
+  hiv_pos ~ crae + crve + crae_crve_ratio + segmented_fractal_analysis +
+    skeleton_fractal_analysis + average_arterial_tree_diameter +
+    arterial_tree_segments + branch_segment_tortuosity_skewness +
+    branch_segment_tortuosity_kurtosis + branch_segment_length_average +
+    arteriole_branch_parent_width + arteriole_branch_smaller_branch +
+    arteriole_branch_larger_branch + arteriole_branch_angle +
+    arteriole_branch_optimality + arteriole_mean_asymmetry_ratio +
+    arteriole_mean_angular_asymmetry + venule_branch_parent_width +
+    venule_branch_smaller_branch + venule_branch_larger_branch +
+    venule_branch_angle + venule_branch_optimality +
+    venule_mean_branching_coefficient + venule_mean_asymmetry_ratio +
+    venule_mean_angular_asymmetry,
+  data = trainData,
+  proximity = TRUE
+)
+
+predictions <- predict(rf_model, testData)
+
+postResample(predictions, testData$hiv_pos)
+```
+
+### HIV status: retinal variables and CVD risk factor
+
+```{r}
+#| label: rf-split-hiv-retinal-cvd
+dta_nums <- dta |>
+  select(study_id, hiv_pos, cvd_risk_factor, all_of(retinal_var)) |>
+  drop_na() |>
+  mutate(
+    hiv_pos = as.factor(hiv_pos)
+  )
+
+set.seed(123)
+
+trainIndex <- createDataPartition(dta_nums$hiv_pos, p = 0.6, list = FALSE)
+trainData <- dta_nums[trainIndex, ]
+testData <- dta_nums[-trainIndex, ]
+
+rf_model <- randomForest(
+  hiv_pos ~ cvd_risk_factor + crae + crve + crae_crve_ratio +
+    segmented_fractal_analysis + skeleton_fractal_analysis +
+    average_arterial_tree_diameter + arterial_tree_segments +
+    branch_segment_tortuosity_skewness + branch_segment_tortuosity_kurtosis +
+    branch_segment_length_average + arteriole_branch_parent_width +
+    arteriole_branch_smaller_branch + arteriole_branch_larger_branch +
+    arteriole_branch_angle + arteriole_branch_optimality +
+    arteriole_mean_asymmetry_ratio + arteriole_mean_angular_asymmetry +
+    venule_branch_parent_width + venule_branch_smaller_branch +
+    venule_branch_larger_branch + venule_branch_angle +
+    venule_branch_optimality + venule_mean_branching_coefficient +
+    venule_mean_asymmetry_ratio + venule_mean_angular_asymmetry,
+  data = trainData,
+  proximity = TRUE
+)
+
+predictions <- predict(rf_model, testData)
+
+postResample(predictions, testData$hiv_pos)
+```
+
+### ART status: retinal variables
+
+```{r}
+#| label: rf-split-art-retinal
+dta_nums <- dta |>
+  select(study_id, on_art, all_of(retinal_var)) |>
+  drop_na() |>
+  mutate(
+    on_art = as.factor(on_art)
+  )
+
+set.seed(123)
+
+trainIndex <- createDataPartition(dta_nums$on_art, p = 0.6, list = FALSE)
+trainData <- dta_nums[trainIndex, ]
+testData <- dta_nums[-trainIndex, ]
+
+rf_model <- randomForest(
+  on_art ~ crae + crve + crae_crve_ratio + segmented_fractal_analysis +
+    skeleton_fractal_analysis + average_arterial_tree_diameter +
+    arterial_tree_segments + branch_segment_tortuosity_skewness +
+    branch_segment_tortuosity_kurtosis + branch_segment_length_average +
+    arteriole_branch_parent_width + arteriole_branch_smaller_branch +
+    arteriole_branch_larger_branch + arteriole_branch_angle +
+    arteriole_branch_optimality + arteriole_mean_asymmetry_ratio +
+    arteriole_mean_angular_asymmetry + venule_branch_parent_width +
+    venule_branch_smaller_branch + venule_branch_larger_branch +
+    venule_branch_angle + venule_branch_optimality +
+    venule_mean_branching_coefficient + venule_mean_asymmetry_ratio +
+    venule_mean_angular_asymmetry,
+  data = trainData,
+  proximity = TRUE
+)
+
+predictions <- predict(rf_model, testData)
+
+postResample(predictions, testData$on_art)
+
+# Note: accuracy here mostly reflects class imbalance (far more participants
+# are on ART than ART-naive). The imbalance is not corrected for.
+```
+
+### HIV status: significant variables and covariates
+
+```{r}
+#| label: rf-split-hiv-sig
+dta_nums <- dta |>
+  select(
+    study_id, hiv_pos, age, gender, bmi, cvd_risk_factor, crve,
+    venule_branch_larger_branch, venule_branch_parent_width,
+    skeleton_fractal_analysis
+  ) |>
+  drop_na() |>
+  mutate(
+    hiv_pos = as.factor(hiv_pos)
+  )
+
+set.seed(123)
+
+trainIndex <- createDataPartition(dta_nums$hiv_pos, p = 0.6, list = FALSE)
+trainData <- dta_nums[trainIndex, ]
+testData <- dta_nums[-trainIndex, ]
+
+rf_model <- randomForest(
+  hiv_pos ~ age + gender + bmi + cvd_risk_factor + crve +
+    venule_branch_larger_branch + venule_branch_parent_width +
+    skeleton_fractal_analysis,
+  data = trainData,
+  proximity = TRUE
+)
+
+predictions <- predict(rf_model, testData)
+
+postResample(predictions, testData$hiv_pos)
+```
+
+:::
+
+## Session information
+
+R and package versions from the last render.
+
+```{r}
+#| label: session-info
+sessionInfo()
+```
